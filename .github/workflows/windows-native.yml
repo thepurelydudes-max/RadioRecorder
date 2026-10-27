@@ -17,12 +17,12 @@ jobs:
         run: |
           if (Test-Path 'RadioRecorder.csproj') {
             "dir=." >> $env:GITHUB_OUTPUT
-          } elseif (Test-Path 'RadioRecorder-Native-1.1-repository.zip') {
+          } elseif (Test-Path 'RadioRecorder-Native-1.2-source.zip') {
             New-Item -ItemType Directory -Force source | Out-Null
-            Expand-Archive 'RadioRecorder-Native-1.1-repository.zip' source -Force
+            Expand-Archive 'RadioRecorder-Native-1.2-source.zip' source -Force
             "dir=source" >> $env:GITHUB_OUTPUT
           } else {
-            Write-Error "Исходники не найдены: загрузите содержимое ZIP или RadioRecorder-Native-1.1-repository.zip в корень репозитория."
+            Write-Error "Исходники не найдены: загрузите содержимое ZIP или RadioRecorder-Native-1.2-source.zip в корень репозитория."
           }
       - uses: actions/setup-dotnet@v4
         with:
