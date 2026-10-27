@@ -1,13 +1,19 @@
-# RadioRecorder Native
+# RadioRecorder
 
-Нативное приложение Windows 10/11 x64 на C# / WinForms. Записывает MP3 с выбранного входа Windows, а CUE — по отдельным метаданным RadioBOSS HTTP API.
+Windows radio-air logger. Two independent editions:
 
-## Текущий статус
+- **Native 1.2 (C# / WinForms):** Windows input audio → MP3 through FFmpeg; RadioBOSS HTTP API or ICY metadata → matching hourly CUE. Native .NET EXE + DLLs, no Python.
+- **Python 0.5 (Tkinter):** continues the original working Python 0.4.1 codebase, preserving DirectShow input recording while adding PortAudio input fallback, Play signal meter, icons and elevated Windows login startup.
 
-Автоматическая сборка настроена в [GitHub Actions](https://github.com/thepurelydudes-max/RadioRecorder/actions/workflows/windows-native.yml), но исходный архив еще не загружен в репозиторий. Для сборки поместите файл `RadioRecorder-Native-1.2-source.zip` в корень репозитория через GitHub **Add file → Upload files**. После загрузки Actions собирает портативный Windows x64 EXE вместе с DLL и FFmpeg, запускает тесты и публикует архив как workflow artifact (если сборка пройдёт успешно).
+## Windows downloads (GitHub Actions)
 
-## Автозапуск с повышенными правами (1.2)
+1. [Native build — successfully completed](https://github.com/thepurelydudes-max/RadioRecorder/actions/runs/40493785636) → **Artifacts** → `RadioRecorder-Native-Windows-x64`.
+2. [Python build](https://github.com/thepurelydudes-max/RadioRecorder/actions/workflows/windows-python.yml) → upload the file `RadioRecorder-Python-0.5.0-source.zip` into the repository root using **Add file → Upload files**. This triggers its own Windows build; after success download `RadioRecorder-Python-Windows-x64`.
 
-В настройках «Запускать вместе с Windows от администратора» впервые запрашивает согласие UAC для создания задания Планировщика Windows. Далее задача запускается при входе интерактивного пользователя с максимальными доступными правами без повторных UAC-подтверждений. Нужна учётная запись с правами администратора. Сохранённое «Авто» включает запись по часовому расписанию. Реальная работа должна быть проверена на Windows.
+Native source currently is in `RadioRecorder-Native-1.2-source.zip`. Two compile issues in that ZIP are automatically patched inside the Native GitHub build workflow. Updated corrected source is available as v1.2.1 upon request.
 
-Полные инструкции находятся в исходном ZIP.
+Both versions need the complete extracted distribution folder, including FFmpeg. Audio from the selected Windows input is independent of RadioBOSS HTTP metadata. A network outage should not stop local MP3 capture. Before using the application continuously in a broadcast chain, verify capture, device reconnect, CUE alignment and retention on a real Windows system.
+
+### Automatic startup
+
+The Native and Python code both support login startup with highest available rights via Windows Task Scheduler, requiring UAC consent for initial installation. The saved Auto checkbox starts recording only during allowed scheduled hours. Manual Stop pauses until the next allowed clock hour, without disabling Auto.
