@@ -1,0 +1,59 @@
+name: Build RadioRecorder Native Windows x64
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Determine source location
+        id: source
+        shell: pwsh
+        run: |
+          if (Test-Path 'RadioRecorder.csproj') {
+            "dir=." >> $env:GITHUB_OUTPUT
+          } elseif (Test-Path 'RadioRecorder-Native-1.1-repository.zip') {
+            New-Item -ItemType Directory -Force source | Out-Null
+            Expand-Archive 'RadioRecorder-Native-1.1-repository.zip' source -Force
+            "dir=source" >> $env:GITHUB_OUTPUT
+          } else {
+            Write-Error "Исходники не найдены: загрузите содержимое ZIP или RadioRecorder-Native-1.1-repository.zip в корень репозитория."
+          }
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Compile and run core tests
+        shell: pwsh
+        working-directory: ${{ steps.source.outputs.dir }}
+        run: dotnet run --project tests/RadioRecorder.CoreTests.csproj --configuration Release
+      - name: Publish self-contained Windows EXE and DLLs
+        shell: pwsh
+        run: dotnet publish "${{ steps.source.outputs.dir }}/RadioRecorder.csproj" -c Release -r win-x64 --self-contained true -p:PublishSingleFile=false -p:PublishTrimmed=false -o publish/RadioRecorder
+      - name: Download FFmpeg for MP3 encoding
+        shell: pwsh
+        run: |
+          Invoke-WebRequest 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip' -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip ffmpeg-extracted
+          $ffmpeg = Get-ChildItem ffmpeg-extracted -Filter ffmpeg.exe -Recurse -File | Select-Object -First 1
+          if (-not $ffmpeg) { throw "ffmpeg.exe not found" }
+          Copy-Item $ffmpeg.FullName publish/RadioRecorder/ffmpeg.exe
+          'FFmpeg: https://ffmpeg.org/legal.html' | Out-File publish/RadioRecorder/FFmpeg-NOTICE.txt
+          Get-ChildItem ffmpeg-extracted -File -Recurse | Where-Object { $_.Name -match '^(LICENSE|COPYING)' } | Select-Object -First 10 | ForEach-Object { Copy-Item $_.FullName -Destination (Join-Path 'publish/RadioRecorder' ('FFmpeg-' + $_.Name)) -Force }
+      - name: Include documentation
+        shell: pwsh
+        run: |
+          Copy-Item "${{ steps.source.outputs.dir }}/QUICKSTART_RU.md" publish/RadioRecorder/
+          Copy-Item "${{ steps.source.outputs.dir }}/README.md" publish/RadioRecorder/
+      - name: Create portable archive
+        shell: pwsh
+        run: Compress-Archive -Path publish/RadioRecorder -DestinationPath RadioRecorder-Native-Windows-x64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RadioRecorder-Native-Windows-x64
+          path: RadioRecorder-Native-Windows-x64.zip
+          retention-days: 30
