@@ -27,6 +27,20 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '10.0.x'
+      - name: Apply known C# compilation fixes to archived source
+        shell: pwsh
+        run: |
+          $root = "${{ steps.source.outputs.dir }}"
+          $settings = Join-Path $root 'Core/Settings.cs'
+          $s = [System.IO.File]::ReadAllText($settings)
+          $s = $s.Replace('=> new(now.Year, now.Month, now.Day, now.Hour, 0, 0, now.Kind) + TimeSpan.FromHours(1);', '=> new DateTime(now.Year, now.Month, now.Day, now.Hour, 0, 0, now.Kind).AddHours(1);')
+          [System.IO.File]::WriteAllText($settings, $s)
+          $test = Join-Path $root 'tests/Program.cs'
+          $t = [System.IO.File]::ReadAllText($test)
+          if (-not $t.Contains('using Cue = RadioRecorder.Core.Cue;')) {
+            $t = $t.Replace('using RadioRecorder.Core;', "using RadioRecorder.Core;`nusing Cue = RadioRecorder.Core.Cue;")
+          }
+          [System.IO.File]::WriteAllText($test, $t)
       - name: Compile and run core tests
         shell: pwsh
         working-directory: ${{ steps.source.outputs.dir }}
