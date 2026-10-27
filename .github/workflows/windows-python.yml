@@ -1,0 +1,62 @@
+name: Build RadioRecorder Python Windows x64
+on:
+  push:
+    paths:
+      - 'RadioRecorder-Python-0.5.0-source.zip'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unpack Python RadioRecorder
+        shell: pwsh
+        run: |
+          if (Test-Path 'RadioRecorder/app.py') {
+            "DIR=RadioRecorder" >> $env:GITHUB_ENV
+          } elseif (Test-Path 'RadioRecorder-Python-0.5.0-source.zip') {
+            New-Item -ItemType Directory -Force python-source | Out-Null
+            Expand-Archive 'RadioRecorder-Python-0.5.0-source.zip' python-source -Force
+            "DIR=python-source/RadioRecorder" >> $env:GITHUB_ENV
+          } else {
+            throw "Загрузи RadioRecorder-Python-0.5.0-source.zip в корень репозитория"
+          }
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: x64
+      - name: Install Python dependencies and PyInstaller
+        shell: pwsh
+        run: python -m pip install -r "${{ env.DIR }}/requirements.txt" pyinstaller
+      - name: Run Python unit tests
+        shell: pwsh
+        working-directory: ${{ env.DIR }}
+        run: python -m unittest discover -s tests -v
+      - name: Build portable Windows EXE
+        shell: pwsh
+        working-directory: ${{ env.DIR }}
+        run: python build_windows.py
+      - name: Bundle FFmpeg
+        shell: pwsh
+        run: |
+          Invoke-WebRequest 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip' -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip ffmpeg-files
+          $exe = Get-ChildItem ffmpeg-files -Filter ffmpeg.exe -Recurse -File | Select-Object -First 1
+          if (-not $exe) { throw "ffmpeg.exe not found" }
+          $out = "${{ env.DIR }}/dist/RadioRecorder"
+          Copy-Item $exe.FullName "$out/ffmpeg.exe"
+          Copy-Item "${{ env.DIR }}/README.md" "$out/README.md"
+          Copy-Item "${{ env.DIR }}/QUICKSTART_RU.md" "$out/QUICKSTART_RU.md"
+          'FFmpeg details: https://ffmpeg.org/legal.html' | Out-File "$out/FFmpeg-NOTICE.txt"
+          Get-ChildItem ffmpeg-files -File -Recurse | Where-Object { $_.Name -match '^(LICENSE|COPYING)' } | Select-Object -First 10 | ForEach-Object { Copy-Item $_.FullName "$out/FFmpeg-$($_.Name)" -Force }
+      - name: Archive executable with internal libraries
+        shell: pwsh
+        run: Compress-Archive -Path "${{ env.DIR }}/dist/RadioRecorder" -DestinationPath RadioRecorder-Python-Windows-x64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RadioRecorder-Python-Windows-x64
+          path: RadioRecorder-Python-Windows-x64.zip
+          retention-days: 30
