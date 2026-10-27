@@ -2,6 +2,7 @@ name: Build RadioRecorder Python Windows x64
 on:
   push:
     paths:
+      - 'RadioRecorder-Python-0.6.0-source.zip'
       - 'RadioRecorder-Python-0.5.9-source.zip'
       - 'RadioRecorder-Python-0.5.8-source.zip'
       - 'RadioRecorder-Python-0.5.7-source.zip'
@@ -25,6 +26,10 @@ jobs:
         run: |
           if (Test-Path 'RadioRecorder/app.py') {
             "DIR=RadioRecorder" >> $env:GITHUB_ENV
+          } elseif (Test-Path 'RadioRecorder-Python-0.6.0-source.zip') {
+            New-Item -ItemType Directory -Force python-source | Out-Null
+            Expand-Archive 'RadioRecorder-Python-0.6.0-source.zip' python-source -Force
+            "DIR=python-source/RadioRecorder" >> $env:GITHUB_ENV
           } elseif (Test-Path 'RadioRecorder-Python-0.5.9-source.zip') {
             New-Item -ItemType Directory -Force python-source | Out-Null
             Expand-Archive 'RadioRecorder-Python-0.5.9-source.zip' python-source -Force
