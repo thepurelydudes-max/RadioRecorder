@@ -103,6 +103,14 @@ jobs:
           Copy-Item "${{ env.DIR }}/QUICKSTART_RU.md" "$out/QUICKSTART_RU.md"
           'FFmpeg details: https://ffmpeg.org/legal.html' | Out-File "$out/FFmpeg-NOTICE.txt"
           Get-ChildItem ffmpeg-files -File -Recurse | Where-Object { $_.Name -match '^(LICENSE|COPYING)' } | Select-Object -First 10 | ForEach-Object { Copy-Item $_.FullName "$out/FFmpeg-$($_.Name)" -Force }
+      - name: Verify recording continuation with bundled FFmpeg
+        shell: pwsh
+        working-directory: ${{ env.DIR }}
+        run: |
+          $bundle = (Resolve-Path 'dist/RadioRecorder').Path
+          $encoder = Get-ChildItem "$env:GITHUB_WORKSPACE/ffmpeg-files" -Filter ffmpeg.exe -Recurse -File | Select-Object -First 1
+          $env:PATH = "$bundle;$($encoder.Directory.FullName);$env:PATH"
+          python -m unittest discover -s tests -v
       - name: Archive executable with internal libraries
         shell: pwsh
         run: Compress-Archive -Path "${{ env.DIR }}/dist/RadioRecorder" -DestinationPath RadioRecorder-Python-Windows-x64.zip
