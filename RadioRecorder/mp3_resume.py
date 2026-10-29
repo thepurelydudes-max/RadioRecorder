@@ -157,6 +157,12 @@ class AppendingMP3:
         else:
             self._file = path.open('xb')
 
+    def __enter__(self) -> 'AppendingMP3':
+        return self
+
+    def __exit__(self, _type, _value, _traceback) -> None:
+        self.close()
+
     def append(self, frame: bytes, duration: float) -> None:
         info = frame_info(frame[:4])
         if info is None or info.length != len(frame):
