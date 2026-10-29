@@ -100,3 +100,32 @@ def write_active_cue(path: Path, text: str, previous_text: str | None = None) ->
         file.truncate()
         file.flush()
         os.fsync(file.fileno())
+
+
+def read_existing_cue(path: Path) -> tuple[str, list[tuple[float, str]], str] | None:
+    """Read a previously recorded hour's CUE before adding new MP3 frames.
+
+    Existing INDEX positions describe *recorded audio time*, not wall-clock
+    time. Reconstruct those exact offsets on recovery, including offline gaps.
+    Refuse malformed CUEs rather than overwriting a user's existing metadata.
+    """
+    if not path.exists():
+        return None
+    text = path.read_text(encoding='utf-8-sig')
+    tracks = re.findall(
+        r'(?m)^  TRACK (\\d{2}) AUDIO\\r?\\n'
+        r'    TITLE "([^"\\r\\n]*)"\\r?\\n'
+        r'    INDEX 01 (\\d+):(\\d{2}):(\\d{2})',
+        text)
+    if not tracks or not text.startswith('REM DATE '):
+        raise ValueError('Невозможно восстановить существующий CUE: ' + path.name)
+    if len(tracks) != text.count('  TRACK '):
+        raise ValueError('Неполный CUE: ' + path.name)
+    offsets = []
+    for number, title, minutes, seconds, frames in tracks:
+        if not 0 <= int(seconds) < 60 or not 0 <= int(frames) < 75:
+            raise ValueError('Неверный индекс CUE: ' + path.name)
+        offsets.append((int(minutes)*60 + int(seconds) + int(frames)/75, title))
+    if tracks[0][0] != '01' or offsets[0][0] != 0:
+        raise ValueError('CUE без начальной дорожки: ' + path.name)
+    return offsets[0][1], offsets[1:], text
