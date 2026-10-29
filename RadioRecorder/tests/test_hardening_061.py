@@ -19,7 +19,7 @@ class CleanupSafetyTests(unittest.TestCase):
     def test_only_mp3_and_cue_deleted_non_matching_files_untouched(self):
         with tempfile.TemporaryDirectory() as d:
             folder = Path(d)
-            values = ['old.mp3', 'old.cue', 'old.MP3', 'old.CUE',
+            values = ['old-a.mp3', 'old-b.cue', 'old-c.MP3', 'old-d.CUE',
                       'notes.txt', 'config.json', 'old.mp3.tmp', 'playlist.m3u']
             cutoff = time.time() - 95*86400
             for name in values:
