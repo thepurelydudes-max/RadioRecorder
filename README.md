@@ -1,19 +1,36 @@
 # RadioRecorder
 
-Windows radio-air logger. Two independent editions:
+Radio-air recording application for Windows. Two independent editions:
 
-- **Native 1.2 (C# / WinForms):** Windows input audio → MP3 through FFmpeg; RadioBOSS HTTP API or ICY metadata → matching hourly CUE. Native .NET EXE + DLLs, no Python.
-- **Python 0.5 (Tkinter):** continues the original working Python 0.4.1 codebase, preserving DirectShow input recording while adding PortAudio input fallback, Play signal meter, icons and elevated Windows login startup.
+- **Python v0.6.1 (Tkinter, current):** [editable source code](RadioRecorder/) · [Russian quick start](RadioRecorder/QUICKSTART_RU.md) · [tests](RadioRecorder/tests/).
+- **Native 1.2 (C# / WinForms, experimental):** source archive `RadioRecorder-Native-1.2-source.zip`.
 
-## Windows downloads (GitHub Actions)
+## Current Python source for Codex
 
-1. [Native build — successfully completed](https://github.com/thepurelydudes-max/RadioRecorder/actions/runs/40493785636) → **Artifacts** → `RadioRecorder-Native-Windows-x64`.
-2. [Python build](https://github.com/thepurelydudes-max/RadioRecorder/actions/workflows/windows-python.yml) → upload the file `RadioRecorder-Python-0.5.0-source.zip` into the repository root using **Add file → Upload files**. This triggers its own Windows build; after success download `RadioRecorder-Python-Windows-x64`.
+**Use [RadioRecorder/](RadioRecorder/) as the Python project root.** The old `RadioRecorder-Python-0.5.0-source.zip` at repository root is a historical archive, **not** the current source.
 
-Native source currently is in `RadioRecorder-Native-1.2-source.zip`. Two compile issues in that ZIP are automatically patched inside the Native GitHub build workflow. Updated corrected source is available as v1.2.1 upon request.
+Python v0.6.1 uses the selected local Windows input for MP3 recording and RadioBOSS HTTP API or ICY exclusively for track metadata. It creates hourly MP3/CUE files, manages a recording schedule, and includes file-retention and Windows-startup features.
 
-Both versions need the complete extracted distribution folder, including FFmpeg. Audio from the selected Windows input is independent of RadioBOSS HTTP metadata. A network outage should not stop local MP3 capture. Before using the application continuously in a broadcast chain, verify capture, device reconnect, CUE alignment and retention on a real Windows system.
+### Tests
 
-### Automatic startup
+```bash
+cd RadioRecorder
+python -m pip install -r requirements.txt
+python -m unittest discover -s tests -q
+```
 
-The Native and Python code both support login startup with highest available rights via Windows Task Scheduler, requiring UAC consent for initial installation. The saved Auto checkbox starts recording only during allowed scheduled hours. Manual Stop pauses until the next allowed clock hour, without disabling Auto.
+### Windows EXE
+
+[GitHub Actions: build Python Windows x64](https://github.com/thepurelydudes-max/RadioRecorder/actions/workflows/windows-python.yml) runs when `RadioRecorder/**` source changes and can also be started manually with *Run workflow*. Once complete, download the `RadioRecorder-Python-Windows-x64` artifact.
+
+The EXE distribution is a directory including `_internal` and `ffmpeg.exe`. Do not deploy the EXE without its accompanying dependencies.
+
+### Engineering safeguards
+
+Do not change the existing Tkinter UI layout without an explicit request. Keep audio recording independent of the metadata network. Preserve hourly MP3/CUE alignment, prevent deletion of unrelated archive files, and run the tests after each change.
+
+**Hardware qualification:** Passing tests is not a substitute for testing with actual Windows input devices and running a long-duration recording.
+
+### Native Windows edition
+
+[Native Windows build](https://github.com/thepurelydudes-max/RadioRecorder/actions/workflows/windows-native.yml). Native source is currently retained as a separate ZIP and is not the Python project used by Codex.
