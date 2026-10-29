@@ -75,32 +75,101 @@ def write_cue_atomic(path: Path, text: str) -> None:
             os.unlink(temp)
 
 
-def write_active_cue(path: Path, text: str, previous_text: str | None = None) -> None:
-    """Update only the active CUE without changing its creation timestamp.
+_CUE_TRACK = re.compile(
+    r'(?m)^  TRACK (\d{2}) AUDIO\r?\n'
+    r'    TITLE "([^"\r\n]*)"\r?\n'
+    r'    INDEX 01 (\d+):(\d{2}):(\d{2})(?:\r?\n|$)'
+)
 
-    Most metadata changes append new TRACK lines. Append just the new bytes,
-    which preserves all earlier tracks if power fails during the append.
-    If a title was corrected retroactively we must rewrite the same file.
-    There is no background store/cache of prior hours.
+
+def _cue_entries(text: str, path: Path) -> list[tuple[float, str]]:
+    """Parse contiguous track indexes without changing or normalizing CUE text."""
+    tracks = _CUE_TRACK.findall(text)
+    if not text.startswith('REM DATE ') or not tracks or len(tracks) != text.count('  TRACK '):
+        raise ValueError('Существующий CUE имеет неизвестный формат: ' + path.name)
+    entries: list[tuple[float, str]] = []
+    for i, (num, title, mm, ss, ff) in enumerate(tracks, 1):
+        if int(num) != i or int(ss) >= 60 or int(ff) >= 75:
+            raise ValueError('Неверная нумерация или время CUE: ' + path.name)
+        offset = int(mm) * 60 + int(ss) + int(ff) / 75
+        if (i == 1 and offset != 0) or (entries and offset < entries[-1][0]):
+            raise ValueError('Неверный порядок индексов CUE: ' + path.name)
+        entries.append((offset, title))
+    return entries
+
+
+def _cue_file_name(text: str) -> str | None:
+    matched = re.search(r'(?m)^FILE "([^"\r\n]+)" MP3\r?$', text)
+    return matched.group(1) if matched else None
+
+
+def write_active_cue(path: Path, text: str, previous_text: str | None = None) -> None:
+    """Create a new CUE once, otherwise ONLY append new tracks.
+
+    A resumed hour's existing CUE is authoritative. Never seek to its start,
+    truncate it, or rewrite existing TITLE/INDEX lines, even when newly
+    reconstructed events disagree with previous metadata. Past or duplicate
+    events are ignored, and new track numbers continue from the last on disk.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    data = b'\xef\xbb\xbf' + text.encode('utf-8')
-    if (previous_text and text.startswith(previous_text) and path.exists() and
-            path.stat().st_size == len(b'\xef\xbb\xbf' + previous_text.encode('utf-8'))):
-        extra = text[len(previous_text):].encode('utf-8')
-        if extra:
-            with open(path, 'ab') as file:
-                file.write(extra)
+    if not path.exists():
+        # Exclusive creation prevents accidentally replacing a concurrently
+        # created CUE. The first complete CUE is written once.
+        with path.open('xb') as file:
+            file.write(b'\xef\xbb\xbf' + text.encode('utf-8'))
+            file.flush()
+            os.fsync(file.fileno())
+        return
+
+    existing = path.read_bytes()
+    if not existing.startswith(b'\xef\xbb\xbf'):
+        raise ValueError('CUE без ожидаемого UTF-8 BOM, оставлен без изменений: ' + path.name)
+    original = existing[3:].decode('utf-8')
+    if original == text:
+        return
+
+    # Common fast path: our newly generated text is an exact extension.
+    # This is also used by the earlier in-place append regression.
+    if text.startswith(original):
+        suffix = text[len(original):]
+        if suffix:
+            with path.open('ab') as file:
+                file.write(suffix.encode('utf-8'))
                 file.flush()
                 os.fsync(file.fileno())
         return
-    with open(path, 'r+b' if path.exists() else 'wb') as file:
-        file.seek(0)
-        file.write(data)
-        file.truncate()
-        file.flush()
-        os.fsync(file.fileno())
 
+    # A restart can regenerate earlier entries with slightly different
+    # timing/initial-title metadata. Treat disk content as immutable instead
+    # of falling back to seek(0)/truncate(). Only append truly newer tracks.
+    recorded = _cue_entries(original, path)
+    expected = _cue_entries(text, path)
+    if _cue_file_name(original) != _cue_file_name(text):
+        raise ValueError('Несовпадение FILE в CUE: ' + path.name)
+    if len(recorded) >= 99:
+        return
+    last_offset, last_title = recorded[-1]
+    additions: list[str] = []
+    for offset, title in expected[1:]:
+        if offset <= last_offset + 1e-7 or title == last_title:
+            continue
+        if len(recorded) + len(additions) // 3 >= 99:
+            break
+        number = len(recorded) + len(additions) // 3 + 1
+        additions.extend([
+            f'  TRACK {number:02d} AUDIO',
+            f'    TITLE "{cue_escape(title)}"',
+            f'    INDEX 01 {cue_time(offset)}',
+        ])
+        last_offset, last_title = offset, title
+    if additions:
+        newline = '\r\n' if b'\r\n' in existing else '\n'
+        prefix = '' if original.endswith(('\r', '\n')) else newline
+        extra = (prefix + newline.join(additions) + newline).encode('utf-8')
+        with path.open('ab') as file:
+            file.write(extra)
+            file.flush()
+            os.fsync(file.fileno())
 
 def read_existing_cue(path: Path) -> tuple[str, list[tuple[float, str]], str] | None:
     """Read a previously recorded hour's CUE before adding new MP3 frames.
