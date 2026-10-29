@@ -2,6 +2,7 @@ name: Build RadioRecorder Python Windows x64
 on:
   push:
     paths:
+      - 'RadioRecorder/**'
       - 'RadioRecorder-Python-0.6.1-source.zip'
       - 'RadioRecorder-Python-0.6.0-source.zip'
       - 'RadioRecorder-Python-0.5.9-source.zip'
@@ -72,7 +73,7 @@ jobs:
             Expand-Archive 'RadioRecorder-Python-0.5.0-source.zip' python-source -Force
             "DIR=python-source/RadioRecorder" >> $env:GITHUB_ENV
           } else {
-            throw "Загрузи RadioRecorder-Python-0.5.2-source.zip в корень репозитория"
+            throw "Python source not found: RadioRecorder/app.py"
           }
       - uses: actions/setup-python@v5
         with:
