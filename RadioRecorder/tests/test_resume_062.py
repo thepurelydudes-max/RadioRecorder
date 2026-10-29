@@ -134,7 +134,7 @@ class HourlyResumeTests(unittest.TestCase):
         path.write_bytes(b'user existing cue')
         with patch('engine.datetime', wraps=datetime) as clock:
             clock.now.return_value = datetime(2026, 10, 29, 18, 2)
-            with self.assertRaises(ValueError):
+            with self.assertRaisesRegex(RuntimeError, 'CUE'):
                 rec._append_encoded_frame(FRAME, INFO.duration)
         self.assertEqual(path.read_bytes(), b'user existing cue')
 
