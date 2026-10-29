@@ -13,7 +13,18 @@ class ExitConfirmationTests(unittest.TestCase):
         object.__setattr__(ui, 'monitor', MagicMock())
         object.__setattr__(ui, 'metadata', MagicMock())
         object.__setattr__(ui, 'destroy', MagicMock())
+        object.__setattr__(ui, '_closing', False)
+        object.__setattr__(ui, '_closed', False)
+        object.__setattr__(ui, '_recording_action', None)
+        object.__setattr__(ui, '_recording_generation', 0)
+        object.__setattr__(ui, 'status_var', MagicMock())
+        object.__setattr__(ui, 'recording_control', MagicMock())
+        ui.recording_control.close.return_value = 1
         return ui
+
+    def finish_close(self, ui):
+        # Completion is delivered by the serialized worker on the Tk queue.
+        ui._recording_state({'generation': 1, 'state': 'closed', 'error': None})
 
     @patch('app.windows_keep_awake')
     @patch('app.messagebox.askyesno', return_value=False)
@@ -31,6 +42,8 @@ class ExitConfirmationTests(unittest.TestCase):
         ui = self.setup_ui(False, True)
         ui._on_close()
         ask.assert_called_once()
+        ui.destroy.assert_not_called()
+        self.finish_close(ui)
         ui.destroy.assert_called_once()
 
     @patch('app.windows_keep_awake')
@@ -39,7 +52,7 @@ class ExitConfirmationTests(unittest.TestCase):
         ui = self.setup_ui(True, True)
         ui._on_close()
         self.assertIn('Остановить запись', ask.call_args.args[1])
-        ui.recorder.stop.assert_called_once()
+        ui.recording_control.close.assert_called_once()
 
     @patch('app.windows_keep_awake')
     @patch('app.messagebox.askyesno')
@@ -47,8 +60,10 @@ class ExitConfirmationTests(unittest.TestCase):
         ui = self.setup_ui(False, False)
         ui._on_close()
         ask.assert_not_called()
+        self.finish_close(ui)
         ui.destroy.assert_called_once()
 
 
 if __name__ == '__main__':
     unittest.main()
+

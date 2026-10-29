@@ -25,6 +25,8 @@ from alerts import send_silence_email
 from autostart import configure_login, normalize_startup_settings
 from single_instance import SingleInstanceGuard, show_existing_window
 from device_names import friendly_device_name, settings_device_choices, selection_label
+from recording_control import RecordingControl
+from archive_listing import read_archive_rows
 
 TITLE = "RadioRecorder (0.6.1)"
 
@@ -544,11 +546,8 @@ class SettingsWindow(tk.Toplevel):
             self.master_ui.cfg = new
             # Retention settings apply immediately while current audio source
             # and MP3 settings are switched at the next recording start.
-            if self.master_ui.recorder.running:
-                with self.master_ui.recorder.lock:
-                    self.master_ui.recorder.cfg.update(
-                        retention_enabled=new['retention_enabled'],
-                        retention_days=new['retention_days'])
+            self.master_ui.recording_control.update_retention(
+                new['retention_enabled'], new['retention_days'])
             windows_keep_awake(bool(new.get('keep_awake')))
             self.master_ui._reload_settings()
             self.master_ui._log('Настройки сохранены. Изменения аудиоформата — со следующего запуска записи.')
@@ -615,6 +614,14 @@ class RadioRecorderUI(tk.Tk):
         self.metadata = MetadataMonitor(self._on_metadata, lambda s: self.events.put(('log', s)))
         self.monitor = AudioMonitor(lambda active, msg: self.events.put(('monitor_state', (active, msg))),
                                     lambda db: self.events.put(('monitor_meter', db)))
+        self.recording_control = RecordingControl(
+            self.recorder, self.metadata,
+            lambda state: self.events.put(('recording_state', state)), self.monitor.close)
+        self._recording_action: str | None = None
+        self._recording_generation = 0
+        self._recording_automatic = False
+        self._closing = False
+        self._closed = False
         self.monitor_active = False
         self._current_db = -60.0
         self.elapsed = tk.StringVar(value='0:00:00')
@@ -718,6 +725,8 @@ class RadioRecorderUI(tk.Tk):
                                relief='sunken' if active else 'raised')
 
     def _toggle_monitor(self):
+        if getattr(self, '_closing', False):
+            return
         if self.monitor.running:
             self.monitor.stop()
             self._paint_monitor(False)
@@ -796,6 +805,16 @@ class RadioRecorderUI(tk.Tk):
                 what, value = self.events.get_nowait()
                 if what == 'log':
                     self._log(value)
+                elif what == 'recording_state':
+                    self._recording_state(value)
+                    if self._closed:
+                        return
+                elif what == 'archive_rows':
+                    callback, args = value
+                    try:
+                        callback(*args)
+                    except tk.TclError:
+                        pass  # the archive window may have closed during its scan
                 elif what == 'track':
                     self._log('CUE: ' + value)
                 elif what == 'elapsed':
@@ -847,39 +866,70 @@ class RadioRecorderUI(tk.Tk):
         self.level_text.set(f'{db:.1f} dBFS')
 
     def _start(self, automatic: bool = False):
-        if self.recorder.running:
+        if (self._closing or self._recording_action == 'start' or
+                (self.recorder.running and self._recording_action != 'stop')):
             return
         if not automatic:
             # A deliberate Rec cancels the manual pause and can start now.
             self.manual_pause_until = None
             self.auto_retry_after = None
-        try:
-            self.recorder.start(self.cfg, self.metadata.last_title or '')
-            self._reload_settings()  # show mono when a stereo input fell back to one channel
-            c = self.cfg
-            self.metadata.start(c.get('metadata_mode', 'none'),
-                c['metadata_api_url'] if c.get('metadata_mode') == 'api' else c['metadata_icy_url'],
-                c.get('metadata_password', ''), c.get('metadata_username', ''))
+        self._recording_action = 'start'
+        self._recording_automatic = automatic
+        self.status_var.set('● Запуск записи')
+        self._recording_generation = self.recording_control.start(
+            self.cfg, self.metadata.last_title or '')
+
+    def _recording_state(self, result: dict):
+        if result['generation'] != self._recording_generation:
+            return  # a newer Stop/Rec/close superseded this completion
+        state, error = result['state'], result.get('error')
+        if state == 'stopping':
+            self._log('Ожидание завершения записи: ' + str(error))
+            return
+        if state == 'closed':
+            if error:
+                self._log('Ошибка завершения: ' + error)
+            windows_keep_awake(False)
+            self._closed = True
+            self.destroy()
+            return
+        if self._closing:
+            return
+        self._recording_action = None
+        self._reload_settings()  # includes any mono fallback discovered by start
+        if state == 'started':
             self.status_var.set('● Запись идёт')
             self._paint_recording(True)
-        except Exception as exc:
-            self._log('Ошибка запуска: ' + str(exc))
-            if automatic:
+            if result.get('metadata_error'):
+                self._log('Ошибка метаданных: ' + result['metadata_error'])
+        elif state == 'failed':
+            self._log('Ошибка запуска: ' + str(error))
+            self._paint_recording(False)
+            if self._recording_automatic:
                 # No error dialog every heartbeat while no sound card is set.
                 self.auto_retry_after = datetime.now() + timedelta(seconds=30)
                 self.status_var.set('● Ошибка автозаписи — повтор через 30 сек')
             else:
-                messagebox.showerror('Не удалось начать запись', str(exc), parent=self)
+                self.status_var.set('● Остановлено')
+                messagebox.showerror('Не удалось начать запись', str(error), parent=self)
+        else:
+            if error:
+                self._log('Ошибка остановки: ' + error)
+            if self.auto.get() and self.manual_pause_until and datetime.now() < self.manual_pause_until:
+                self.status_var.set('● Пауза до ' + self.manual_pause_until.strftime('%H:%M') + ' (Авто)')
+            else:
+                self.status_var.set('● Остановлено')
+            self._paint_recording(False)
+            if not self.monitor.running:
+                self._show_level(-60.0)
+            self.elapsed.set('0:00:00')
 
     def _stop(self):
-        self.metadata.stop()
-        self.recorder.stop()
-        self._reload_settings()
-        self.status_var.set('● Остановлено')
-        self._paint_recording(False)
-        if not self.monitor.running:
-            self._show_level(-60.0)
-        self.elapsed.set('0:00:00')
+        if self._closing or self._recording_action == 'stop':
+            return
+        self._recording_action = 'stop'
+        self.status_var.set('● Остановка записи')
+        self._recording_generation = self.recording_control.stop()
 
     def _stop_manual(self):
         if self.auto.get():
@@ -905,14 +955,15 @@ class RadioRecorderUI(tk.Tk):
             self._log('Автоматическая запись выключена')
 
     def _schedule_check(self, now: datetime | None = None):
-        if not self.auto.get():
+        if getattr(self, '_closing', False) or not self.auto.get():
             return
         now = now or datetime.now()
         needed = is_schedule_active(self.cfg, now)
-        if not needed and self.recorder.running:
+        action = getattr(self, '_recording_action', None)
+        if not needed and (self.recorder.running or action == 'start') and action != 'stop':
             self._log('Планировщик: время записи закончилось')
             self._stop()
-        elif (not self.recorder.running and
+        elif (not self.recorder.running and action is None and
               auto_should_start(self.cfg, now, self.manual_pause_until) and
               (self.auto_retry_after is None or now >= self.auto_retry_after)):
             self.manual_pause_until = None
@@ -920,9 +971,12 @@ class RadioRecorderUI(tk.Tk):
             self._start(automatic=True)
 
     def _heartbeat(self):
-        if not self.winfo_exists():
+        if self._closing or not self.winfo_exists():
             return
         self._schedule_check()
+        if self._recording_action:
+            self.after(1500, self._heartbeat)
+            return
         # Do not claim recording solely on running flag if ffmpeg has exited.
         proc = self.recorder.process
         if self.recorder.running and (proc is None or proc.poll() is not None):
@@ -959,7 +1013,8 @@ class RadioRecorderUI(tk.Tk):
         window.title('Архив — RadioRecorder')
         window.geometry('650x450')
         window.resizable(False, False)
-        ttk.Label(window, text=f"Записи: {self.cfg['folder']}", padding=7).pack(anchor='w')
+        path_label = ttk.Label(window, text=f"Записи: {self.cfg['folder']}", padding=7)
+        path_label.pack(anchor='w')
         rows = ttk.Frame(window, padding=6)
         rows.pack(fill='both', expand=True)
         listing = tk.Listbox(rows, selectmode='browse', font=('Consolas', 10))
@@ -967,16 +1022,58 @@ class RadioRecorderUI(tk.Tk):
         scroll = ttk.Scrollbar(rows, orient='vertical', command=listing.yview)
         scroll.pack(side='right', fill='y')
         listing.config(yscrollcommand=scroll.set)
-        def refresh():
-            # The archive is just an on-demand directory listing. Do not
-            # keep a second list of MP3 paths in application memory.
-            listing.delete(0, 'end')
-            for item in sorted(Path(self.cfg['folder']).glob('*.mp3'), reverse=True):
+        state = dict(generation=0, loading=False, pending=None, folder=Path(self.cfg['folder']))
+
+        def launch_scan(generation, folder):
+            state['loading'] = True
+
+            def scan():
                 try:
-                    size = item.stat().st_size / 1024 / 1024
-                except OSError:
-                    size = 0
-                listing.insert('end', f'{item.name:<45} {size:>7.1f} МБ' + ('  [CUE]' if item.with_suffix('.cue').exists() else ''))
+                    result = read_archive_rows(folder)
+                except Exception as exc:
+                    self.events.put(('log', 'Ошибка архива: ' + str(exc)))
+                    result = []
+                self.events.put(('archive_rows', (rows_ready, (generation, result))))
+
+            threading.Thread(target=scan, name='archive-scan', daemon=True).start()
+
+        def rows_ready(generation, result):
+            state['loading'] = False
+            if self._closing or not window.winfo_exists():
+                return
+            pending = state['pending']
+            state['pending'] = None
+            if pending is not None:
+                launch_scan(*pending)
+                return
+            if generation != state['generation']:
+                return
+
+            def insert_batch(offset=0):
+                if self._closing or generation != state['generation'] or not window.winfo_exists():
+                    return
+                chunk = result[offset:offset + 200]
+                if chunk:
+                    listing.insert('end', *chunk)
+                if offset + 200 < len(result):
+                    self.after(1, lambda: insert_batch(offset + 200))
+
+            insert_batch()
+
+        def refresh():
+            # Keep only the displayed rows after this on-demand snapshot. A
+            # single worker per window coalesces repeated Refresh requests.
+            if self._closing or not window.winfo_exists():
+                return
+            state['generation'] += 1
+            state['folder'] = Path(self.cfg['folder'])
+            path_label.configure(text=f"Записи: {state['folder']}")
+            listing.delete(0, 'end')
+            request = (state['generation'], state['folder'])
+            if state['loading']:
+                state['pending'] = request
+            else:
+                launch_scan(*request)
         def open_selected(cue=False):
             if not listing.curselection():
                 return
@@ -986,7 +1083,7 @@ class RadioRecorderUI(tk.Tk):
             end = line.lower().rfind('.mp3')
             if end < 0:
                 return
-            item = Path(self.cfg['folder']) / line[:end + 4]
+            item = state['folder'] / line[:end + 4]
             if cue:
                 item = item.with_suffix('.cue')
                 if not item.exists():
@@ -1006,19 +1103,21 @@ class RadioRecorderUI(tk.Tk):
         refresh()
 
     def _on_close(self):
+        if self._closing:
+            return
         # The confirmation preference must apply to ANY exit, even if the
         # recorder is currently stopped. Recording only changes the wording.
         if self.cfg.get('ask_on_exit', True):
             prompt = ('Остановить запись и закрыть RadioRecorder?'
-                      if self.recorder.running else 'Закрыть RadioRecorder?')
+                      if self.recorder.running or self._recording_action == 'start'
+                      else 'Закрыть RadioRecorder?')
             if not messagebox.askyesno('RadioRecorder', prompt, parent=self):
                 return
         self.auto.set(False)
-        self.monitor.close()
-        self.metadata.stop()
-        self.recorder.stop()
-        windows_keep_awake(False)
-        self.destroy()
+        self._closing = True
+        self._recording_action = 'close'
+        self.status_var.set('● Завершение работы')
+        self._recording_generation = self.recording_control.close()
 
 
 def main():
@@ -1035,3 +1134,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+

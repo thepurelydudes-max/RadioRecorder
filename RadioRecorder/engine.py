@@ -39,6 +39,10 @@ SETTINGS_FILE = DATA_DIR / 'settings.json'
 RETENTION_STATE_FILE = DATA_DIR / 'retention_state.json'
 
 
+class _RetentionChanged(Exception):
+    """Retry an incomplete cleanup using the newly saved retention policy."""
+
+
 def atomic_json_write(path: Path, obj: dict) -> None:
     """Keep previous settings safe on crashes, and avoid writing to Program Files."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -247,12 +251,25 @@ def choose_output_pattern(folder: Path, fmt: str, at: datetime, minutes: int,
         if len(names) != len(set(names)):
             raise ValueError('Шаблон имени создаёт одинаковые имена для разных часов. '
                              'Добавь в формат день, месяц, год, часы и при необходимости минуты.')
+    # One short-lived index replaces thousands of individual stat calls.
+    # Keep Path.exists semantics: directories and live links occupy a name;
+    # broken links do not. normcase preserves Windows case-insensitivity.
+    occupied = None
+    if split_enabled:
+        with os.scandir(folder) as entries:
+            occupied = {os.path.normcase(entry.name) for entry in entries
+                        if entry.name.lower().endswith(('.mp3', '.cue'))
+                        and (not entry.is_symlink() or Path(entry.path).exists())}
     for n in range(1, 10001):
         suffix = '' if n == 1 else f'_{n}'
         pattern = fmt + suffix + '.mp3'
-        if all(not (folder / (name + suffix + '.mp3')).exists()
-               and not (folder / (name + suffix + '.cue')).exists()
-               for name in names):
+        if occupied is not None:
+            available = all(os.path.normcase(name + suffix + ext) not in occupied
+                            for name in names for ext in ('.mp3', '.cue'))
+        else:
+            available = all(not (folder / (name + suffix + ext)).exists()
+                            for name in names for ext in ('.mp3', '.cue'))
+        if available:
             return pattern
     raise RuntimeError('Слишком много совпадающих имён MP3/CUE в папке записи')
 
@@ -293,8 +310,23 @@ class Recorder:
         self.next_warning_sent = False
         self._audio_thread: threading.Thread | None = None
         self._job_handle = None
+        self._cleanup_cancel = threading.Event()
+        self._cleanup_thread: threading.Thread | None = None
+        self._cleanup_run_lock = threading.Lock()
+        self._retention_override: tuple[bool, int] | None = None
+        self.input_overflows = 0
+
+    def update_retention(self, enabled: bool, days: int) -> None:
+        """Keep a settings save effective even while start is validating input."""
+        days = normalize_retention_days(days)
+        with self.lock:
+            self._retention_override = (enabled, days)
+            self.cfg.update(retention_enabled=enabled, retention_days=days)
 
     def start(self, config: dict, initial_title: str = "") -> None:
+        if (self.watch_thread is not None and self.watch_thread.is_alive()
+                and self.stop_requested.is_set()):
+            raise RuntimeError('Предыдущая запись ещё завершается. Повтори запуск после её завершения.')
         if self.running:
             return
         ffmpeg = ffmpeg_path()
@@ -307,7 +339,11 @@ class Recorder:
         ensure_disk_space(output)
         if not config.get('split_enabled', True) and int(config.get('split_minutes', 60)) != 60:
             self.on_status("Разделение отключено: будет один файл")
-        self.cfg = config.copy()
+        with self.lock:
+            self.cfg = config.copy()
+            if self._retention_override is not None:
+                enabled, days = self._retention_override
+                self.cfg.update(retention_enabled=enabled, retention_days=days)
         self.recording_started = datetime.now()
         self.segment = None
         self.events.clear()
@@ -318,7 +354,10 @@ class Recorder:
         self.last_title = initial_title or 'Неизвестный трек'
         self.initial_title = self.last_title
         self.stop_requested.clear()
+        self._cleanup_cancel.set()
+        self._cleanup_cancel = threading.Event()
         self.next_warning_sent = False
+        self.input_overflows = 0
         self.running = True
         try:
             self._spawn()
@@ -457,8 +496,16 @@ class Recorder:
             with sd.RawInputStream(samplerate=rate, device=device_id,
                                    channels=channels, dtype='int16', blocksize=1024) as stream:
                 last_meter = 0.0
+                last_overflow_warning = float('-inf')
                 while not self.stop_requested.is_set() and proc.poll() is None:
                     data, overflow = stream.read(1024)
+                    if overflow:
+                        self.input_overflows += 1
+                        now = time.monotonic()
+                        if now - last_overflow_warning >= 60:
+                            last_overflow_warning = now
+                            self.on_status('Переполнение аудиобуфера Windows/PortAudio: '
+                                           f'возможны пропуски звука (событий: {self.input_overflows})')
                     if time.monotonic() - last_meter >= 0.12:
                         last_meter = time.monotonic()
                         self.on_meter(peak_dbfs(data))
@@ -508,6 +555,33 @@ class Recorder:
             self.on_status('FFmpeg завершился: ' + ' | '.join(recent_lines[-3:])[-380:])
 
     def _watch(self) -> None:
+        """Always retire a failed session, including unexpected filesystem errors."""
+        try:
+            self._start_cleanup_worker()
+            self._watch_loop()
+        except Exception as exc:
+            self.on_status('Ошибка наблюдения за записью: ' + str(exc))
+        finally:
+            self.stop_requested.set()
+            self._cleanup_cancel.set()
+            try:
+                proc = self.process
+                if proc is not None:
+                    self._stop_encoder(proc)
+            except Exception as exc:
+                self.on_status('Ошибка завершения FFmpeg: ' + str(exc))
+            try:
+                self._discover_segments()
+                with self.lock:
+                    self._update_current_cue()
+            except Exception as exc:
+                self.on_status('Ошибка завершения записи: ' + str(exc))
+            finally:
+                with self.lock:
+                    self._forget_active_segment()
+                self.running = False
+
+    def _watch_loop(self) -> None:
         last_bytes = -1
         last_growth = time.monotonic()
         next_disk_check = time.monotonic()
@@ -558,13 +632,24 @@ class Recorder:
                 last_growth = time.monotonic()
             if self.recording_started:
                 self.on_elapsed((datetime.now() - self.recording_started).total_seconds())
-            self.cleanup_if_due()
             self.stop_requested.wait(0.25)
-        self._discover_segments()
-        with self.lock:
-            self._update_current_cue()
-            self._forget_active_segment()
-        self.running = False
+
+    def _start_cleanup_worker(self) -> None:
+        """Slow archive scans must never delay segment discovery or metadata."""
+        cancel = self._cleanup_cancel
+
+        def cleanup_worker():
+            while not cancel.is_set():
+                try:
+                    self.cleanup_if_due(cancel=cancel)
+                except Exception as exc:
+                    self.on_status('Ошибка фоновой автоочистки: ' + str(exc))
+                if cancel.wait(1):
+                    break
+
+        self._cleanup_thread = threading.Thread(target=cleanup_worker,
+                                                name='archive-cleanup', daemon=True)
+        self._cleanup_thread.start()
 
     def _segment_end(self) -> datetime:
         """Boundary of the active MP3; later metadata belongs to the NEXT CUE."""
@@ -715,23 +800,32 @@ class Recorder:
         except OSError as exc:
             self.on_status('Ошибка CUE: ' + str(exc))
 
-    def stop(self) -> None:
-        self.stop_requested.set()
-        proc = self.process
-        if proc is not None:
+    def _stop_encoder(self, proc: subprocess.Popen) -> None:
+        """Use the same bounded termination and kill fallback on every exit."""
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+            proc.wait(timeout=4)
+        except (OSError, subprocess.TimeoutExpired):
             try:
                 if proc.poll() is None:
-                    proc.terminate()
-                proc.wait(timeout=4)
-            except (OSError, subprocess.TimeoutExpired):
-                try:
-                    if proc.poll() is None:
-                        proc.kill()
-                    proc.wait(timeout=2)
-                except (OSError, subprocess.TimeoutExpired) as exc:
-                    self.on_status('FFmpeg не завершился штатно: ' + str(exc))
+                    proc.kill()
+                proc.wait(timeout=2)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                # Retain ownership so a later Stop/close can retry rather than
+                # launch another encoder or hide a still-running process.
+                raise RuntimeError('FFmpeg не завершился штатно: ' + str(exc)) from exc
+
+    def stop(self) -> None:
+        self.stop_requested.set()
+        self._cleanup_cancel.set()
+        proc = self.process
+        if proc is not None:
+            self._stop_encoder(proc)
         if self.watch_thread and self.watch_thread is not threading.current_thread():
             self.watch_thread.join(timeout=3)
+            if self.watch_thread.is_alive():
+                raise RuntimeError('Поток записи ещё завершается; новый сеанс пока недоступен')
         self.process = None
         if self._job_handle is not None:
             release_job(self._job_handle)
@@ -742,19 +836,26 @@ class Recorder:
             self._forget_active_segment()
         self.on_status('Запись остановлена')
 
-    def cleanup_if_due(self, now: datetime | None = None) -> bool:
+    def cleanup_if_due(self, now: datetime | None = None, *,
+                       cancel: threading.Event | None = None) -> bool:
         """Do cleanup at most once per local calendar day while recording.
 
         The daily check runs when recording starts (if not yet done today),
         and again after each subsequent midnight while recording remains on.
         An atomic state file prevents another cleanup after an app restart.
         """
-        if not self.running or not self.cfg.get('retention_enabled', False):
+        if cancel is not None and cancel.is_set():
             return False
-        now = now or datetime.now()
-        folder = Path(self.cfg['folder']).expanduser().resolve()
-        key = str(folder).casefold() if os.name == 'nt' else str(folder)
-        with self.lock:
+        with self._cleanup_run_lock:
+            if cancel is not None and cancel.is_set():
+                return False
+            with self.lock:
+                config = self.cfg.copy()
+                if not self.running or not config.get('retention_enabled', False):
+                    return False
+            now = now or datetime.now()
+            folder = Path(config['folder']).expanduser().resolve()
+            key = str(folder).casefold() if os.name == 'nt' else str(folder)
             desired_state = {'folder': key, 'date': now.date().isoformat()}
             if getattr(self, '_retention_last_in_memory', None) == desired_state:
                 return False
@@ -770,11 +871,15 @@ class Recorder:
                 self._retention_last_in_memory = desired_state
                 return False
             try:
-                deleted = self.cleanup_old(now)
+                deleted = self.cleanup_old(now, config=config, cancel=cancel)
+            except _RetentionChanged:
+                return False
             except (OSError, ValueError) as exc:
                 self._retention_retry_after = time.monotonic() + 300  # avoid repeating errors
                 self.on_status('Автоочистка не завершена: ' + str(exc))
                 return False
+            if cancel is not None and cancel.is_set():
+                return False  # partial/cancelled scans must be retried
             # Persist only when deletion scanning completed; log any I/O
             # error, but suppress repeated scans in this process.
             state = desired_state
@@ -786,18 +891,22 @@ class Recorder:
             self.on_status(f'Ежедневная автоочистка: удалено файлов: {deleted}')
             return True
 
-    def cleanup_old(self, now: datetime | None = None) -> int:
+    def cleanup_old(self, now: datetime | None = None, *, config: dict | None = None,
+                    cancel: threading.Event | None = None) -> int:
         """Delete only expired MP3/CUE files in the recordings directory.
 
         Retention uses whole calendar days: before midnight (today - N days).
         Never recurse, follow symlinks, or delete an open audio/CUE file.
         Call directly for tests; normal operation goes via cleanup_if_due().
         """
-        if not self.cfg.get('retention_enabled', False):
+        if config is None:
+            with self.lock:
+                config = self.cfg.copy()
+        if not config.get('retention_enabled', False):
             return 0
         now = now or datetime.now()
-        days = normalize_retention_days(self.cfg.get('retention_days', 90))
-        folder = Path(self.cfg.get('folder', '')).expanduser().resolve()
+        days = normalize_retention_days(config.get('retention_days', 90))
+        folder = Path(config.get('folder', '')).expanduser().resolve()
         if (not folder.is_dir() or folder == folder.parent or
             folder == Path.home().resolve() or
             folder == APP_DIR.resolve() or folder in APP_DIR.resolve().parents):
@@ -805,22 +914,33 @@ class Recorder:
         deadline = (now.replace(hour=0, minute=0, second=0, microsecond=0)
                     - timedelta(days=days)).timestamp()
         count = 0
-        with self.lock:
-            # Only the currently open MP3/CUE are protected. Past hours are
-            # never held in the Recorder or modified during cleanup.
-            active = {self.segment.path.resolve(), self.segment.path.with_suffix('.cue').resolve()} if self.segment else set()
-            for file in folder.iterdir():
-                if (file.is_symlink() or not file.is_file() or
-                        file.suffix.lower() not in ('.mp3', '.cue') or
-                        file.resolve() in active):
+        for file in folder.iterdir():
+            if cancel is not None and cancel.is_set():
+                break
+            if file.suffix.lower() not in ('.mp3', '.cue'):
+                continue
+            try:
+                if file.is_symlink() or not file.is_file() or file.stat().st_mtime >= deadline:
                     continue
-                try:
-                    if file.stat().st_mtime < deadline:
-                        file.unlink()
-                        count += 1
-                        self.on_status('Удалён старый файл: ' + file.name)
-                except OSError as exc:
-                    self.on_status('Автоудаление ' + file.name + ': ' + str(exc))
+                resolved = file.resolve()
+                # The active segment may change during the scan. Recheck at
+                # deletion time; never hold this lock over directory iteration.
+                with self.lock:
+                    if cancel is not None and cancel.is_set():
+                        break
+                    if cancel is not None and any(self.cfg.get(key) != config.get(key)
+                            for key in ('folder', 'retention_enabled', 'retention_days')):
+                        raise _RetentionChanged()
+                    active = ({self.segment.path.resolve(),
+                               self.segment.path.with_suffix('.cue').resolve()}
+                              if self.segment else set())
+                    if resolved in active or file.is_symlink() or file.stat().st_mtime >= deadline:
+                        continue
+                    file.unlink()
+                count += 1
+                self.on_status('Удалён старый файл: ' + file.name)
+            except OSError as exc:
+                self.on_status('Автоудаление ' + file.name + ': ' + str(exc))
         return count
 
 
@@ -844,3 +964,4 @@ def auto_should_start(cfg: dict, now: datetime,
 def is_schedule_active(cfg: dict, at: datetime | None = None) -> bool:
     at = at or datetime.now()
     return bool(cfg.get('schedule', DEFAULTS['schedule'])[at.weekday()][at.hour])
+
