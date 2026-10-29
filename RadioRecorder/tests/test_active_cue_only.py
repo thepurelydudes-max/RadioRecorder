@@ -153,7 +153,10 @@ class ActiveCueOnlyTests(unittest.TestCase):
         self.recorder._discover_segments()
         self.recorder.add_event(TrackEvent(datetime(2026, 10, 27, 18, 2), 'Уже звучит', 'API playbackinfo'))
         text = mp3.with_suffix('.cue').read_text(encoding='utf-8-sig')
-        self.assertIn('TITLE "Уже звучит"', text)
+        # Once the original CUE is written, it is immutable. Late API
+        # corrections must not replace the already saved first TITLE.
+        self.assertIn('TITLE "Неизвестный трек"', text)
+        self.assertNotIn('TITLE "Уже звучит"', text)
         self.assertEqual(text.count('  TRACK '), 1)
 
     def test_live_cue_edit_preserves_same_file(self):
