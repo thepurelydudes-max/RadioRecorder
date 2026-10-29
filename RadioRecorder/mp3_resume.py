@@ -138,6 +138,7 @@ class AppendingMP3:
         existing = inspect_existing(path)
         self.previous_seconds = existing.seconds
         self.seconds = existing.seconds
+        self.frames = existing.frames
         self._file = None
         if path.exists():
             self._file = path.open('r+b')
@@ -162,6 +163,7 @@ class AppendingMP3:
             raise ValueError('Попытка записать неполный MP3-кадр')
         self._file.write(frame)
         self.seconds += duration
+        self.frames += 1
 
     def flush(self) -> None:
         if self._file:
@@ -170,6 +172,61 @@ class AppendingMP3:
     def close(self) -> None:
         if self._file:
             self._file.flush()
+            self._refresh_existing_xing()
             os.fsync(self._file.fileno())
             self._file.close()
             self._file = None
+
+    def _refresh_existing_xing(self) -> None:
+        """Update FFmpeg's old Xing/Info duration and byte-count if present.
+
+        Older (pre-resume) hourly MP3 files can have seekable Xing headers.
+        Without this fix, players may report only the original duration after
+        we append new frames. New streams use -write_xing 0.
+        """
+        fh = self._file
+        fh.seek(0)
+        start = id3v2_length(fh.read(10))
+        fh.seek(start)
+        header = fh.read(4)
+        info = frame_info(header)
+        if not info:
+            return
+        version = (header[1] >> 3) & 3
+        mono = header[3] >> 6 == 3
+        has_crc = not bool(header[1] & 1)
+        side = (17 if mono else 32) if version == 3 else (9 if mono else 17)
+        at = start + 4 + (2 if has_crc else 0) + side
+        fh.seek(at)
+        if fh.read(4) not in (b'Xing', b'Info'):
+            return
+        flags = int.from_bytes(fh.read(4), 'big')
+        after = at + 8
+        total_bytes = fh.seek(0, os.SEEK_END) - start
+        if flags & 1:
+            fh.seek(after)
+            fh.write(min(self.frames, 0xffffffff).to_bytes(4, 'big'))
+            after += 4
+        if flags & 2:
+            fh.seek(after)
+            fh.write(min(total_bytes, 0xffffffff).to_bytes(4, 'big'))
+            after += 4
+        if flags & 4:
+            # Update all 100 VBR seek positions too, rather than leaving the
+            # old index pointing into a short, pre-resume version of the MP3.
+            targets = [i * self.frames // 100 for i in range(100)]
+            positions = [0] * 100
+            pos, index, target_index = start, 0, 0
+            while index < self.frames and target_index < 100:
+                while target_index < 100 and index >= targets[target_index]:
+                    positions[target_index] = min(255, (pos - start)*256//max(1, total_bytes))
+                    target_index += 1
+                fh.seek(pos)
+                segment = frame_info(fh.read(4))
+                if segment is None:
+                    break
+                pos += segment.length
+                index += 1
+            fh.seek(after)
+            fh.write(bytes(positions))
+
