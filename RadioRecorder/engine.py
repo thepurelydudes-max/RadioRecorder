@@ -710,7 +710,7 @@ class Recorder:
         intervals. The first file may start mid-hour, so its initial timestamp
         is checked as well. No glob of thousands of archived MP3s is needed.
         """
-        if self.cfg.get('split_enabled', True):
+        if self.cfg.get('split_enabled', True) and self._filename_template is None:
             # The MP3 writer already knows the active segment exactly.
             return
         with self.lock:
