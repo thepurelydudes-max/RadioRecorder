@@ -96,10 +96,9 @@ class SegmentationTest(unittest.TestCase):
                             'bitrate': 128, 'filename_format': '%d-%m-%y_%hh-%mm',
                             'split_enabled': True, 'split_minutes': 60}
             cmd = recorder._build_command()
-            self.assertEqual(cmd[cmd.index('-segment_time') + 1], '3600')
-            self.assertEqual(cmd[cmd.index('-segment_atclocktime') + 1], '1')
-            self.assertEqual(cmd[cmd.index('-strftime') + 1], '1')
-            self.assertIn('%H-%M', cmd[-1])
+            self.assertEqual(cmd[-1], 'pipe:1')
+            self.assertIn('-write_xing', cmd)
+            self.assertIn('-id3v2_version', cmd)
 
 
 class RetentionTest(unittest.TestCase):
