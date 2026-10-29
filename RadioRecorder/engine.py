@@ -836,8 +836,8 @@ class Recorder:
         try:
             write_active_cue(self.segment.path.with_suffix('.cue'), cue_text, self._active_cue_text)
             self._active_cue_text = cue_text
-        except OSError as exc:
-            self.on_status('Ошибка CUE: ' + str(exc))
+        except (OSError, ValueError) as exc:
+            self.on_status('Ошибка CUE (старое содержимое сохранено): ' + str(exc))
 
     def stop(self) -> None:
         self.stop_requested.set()
