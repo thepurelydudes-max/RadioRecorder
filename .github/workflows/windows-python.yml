@@ -2,6 +2,7 @@ name: Build RadioRecorder Python Windows x64
 on:
   push:
     paths:
+      - '.github/workflows/windows-python.yml'
       - 'RadioRecorder/**'
       - 'RadioRecorder-Python-0.6.1-source.zip'
       - 'RadioRecorder-Python-0.6.0-source.zip'
