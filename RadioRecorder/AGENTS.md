@@ -14,7 +14,8 @@ This directory contains the **active Python project**. Ignore the historical v0.
 - RadioBOSS HTTP API or ICY supplies **metadata only**; network failure should not interrupt local audio recording.
 - The recording engine handles only the **current hour's** CUE metadata. Never rewrite old CUE files simply because current metadata changes.
 - Hourly MP3 segments should not require stopping/restarting the input capture.
-- Never overwrite an existing MP3/CUE pair; use safe session suffixes such as `_2`, `_3` when necessary.
+- In hourly split mode, exactly one MP3/CUE pair per wall-clock interval: safely APPEND complete MP3 frames to an existing current-hour MP3 after manual or automatic restart. Never use `_2`, `_3` for hourly sessions. Never truncate valid existing audio or overwrite a malformed/inconsistent CUE; fail safely instead. Preserve legacy single-file collision protection when splitting is disabled.
+- FFmpeg should encode continuously into a pipe in split mode; the recorder's MP3 frame writer must not restart the capture at hour boundaries. Preserve prior-hour MP3 and CUE after rollover, and keep resumed CUE indexes aligned to cumulative recorded audio time (not missing wall-clock time).
 - File retention must operate only on eligible MP3/CUE files; do not delete unrelated formats. Default retention is 90 days, but preserve existing user settings.
 - Preserve the single-instance protection and Windows login scheduling.
 - Preserve all current Tkinter window sizes, widgets, and visual layout unless the task explicitly requests a UI change.
