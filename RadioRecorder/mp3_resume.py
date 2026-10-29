@@ -155,7 +155,7 @@ class AppendingMP3:
                 self._file.truncate(existing.valid_length)
             self._file.seek(0, os.SEEK_END)
         else:
-            self._file = path.open('xb')
+            self._file = path.open('x+b')
 
     def __enter__(self) -> 'AppendingMP3':
         return self
