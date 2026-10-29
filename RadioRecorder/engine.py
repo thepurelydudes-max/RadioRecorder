@@ -1,4 +1,4 @@
-"""RadioRecorder: Windows DirectShow or PortAudio -> FFmpeg continuous MP3 segment muxer.
+"""RadioRecorder: Windows DirectShow or PortAudio -> FFmpeg continuous MP3 encoder.
 
 All worker callbacks are invoked from background threads. Tk callbacks must be
 marshalled to the UI thread with a queue.
@@ -17,7 +17,8 @@ import subprocess
 import threading
 import time
 from typing import Callable
-from cues import TrackEvent, make_cue, write_active_cue
+from cues import TrackEvent, make_cue, write_active_cue, read_existing_cue
+from mp3_resume import FrameStream, AppendingMP3
 from audio_levels import peak_dbfs
 from ffmpeg_job import attach_kill_on_exit_job, release_job
 
@@ -247,13 +248,15 @@ def choose_output_pattern(folder: Path, fmt: str, at: datetime, minutes: int,
         if len(names) != len(set(names)):
             raise ValueError('Шаблон имени создаёт одинаковые имена для разных часов. '
                              'Добавь в формат день, месяц, год, часы и при необходимости минуты.')
+    if split_enabled:
+        # Hourly writer appends complete frames to existing files.
+        return fmt + '.mp3'
     for n in range(1, 10001):
         suffix = '' if n == 1 else f'_{n}'
-        pattern = fmt + suffix + '.mp3'
         if all(not (folder / (name + suffix + '.mp3')).exists()
                and not (folder / (name + suffix + '.cue')).exists()
                for name in names):
-            return pattern
+            return fmt + suffix + '.mp3'
     raise RuntimeError('Слишком много совпадающих имён MP3/CUE в папке записи')
 
 
@@ -292,6 +295,10 @@ class Recorder:
         self.running = False
         self.next_warning_sent = False
         self._audio_thread: threading.Thread | None = None
+        self._output_thread: threading.Thread | None = None
+        self._active_mp3: AppendingMP3 | None = None
+        self._active_hour: datetime | None = None
+        self._output_error: str | None = None
         self._job_handle = None
 
     def start(self, config: dict, initial_title: str = "") -> None:
@@ -315,6 +322,9 @@ class Recorder:
         self._active_cue_text = None
         self._filename_template = None
         self._process_spawn_at = None
+        self._active_hour = None
+        self._active_mp3 = None
+        self._output_error = None
         self.last_title = initial_title or 'Неизвестный трек'
         self.initial_title = self.last_title
         self.stop_requested.clear()
@@ -353,22 +363,14 @@ class Recorder:
         fmt = format_to_strftime(c['filename_format'])
         now = datetime.now()
         mins = int(c.get('split_minutes', 60)) if c.get('split_enabled', True) else 60
-        # The segment muxer expands a single strftime template for the whole
-        # FFmpeg run. Reserve a collision-free suffix for the session including
-        # FUTURE hours, not just its first file. No archive is cached in RAM.
         pat = choose_output_pattern(Path(c['folder']), fmt, now, mins,
                                     bool(c.get('split_enabled', True)))
-        # Needed to find the current FFmpeg output by its predictable name;
-        # never enumerate or cache old recordings in a watch loop.
-        self._filename_template = pat
+        self._filename_template = None if c.get('split_enabled', True) else pat
         self._process_spawn_at = now
         if c.get('split_enabled', True):
-            mins = int(c.get('split_minutes', 60))
-            if not 1 <= mins <= 1440:
-                raise ValueError('Неверный интервал разделения')
-            cmd += ['-f', 'segment', '-segment_format', 'mp3', '-segment_time',
-                    str(mins * 60), '-segment_atclocktime', '1',
-                    '-reset_timestamps', '1', '-strftime', '1', str(Path(c['folder']) / pat)]
+            # Continuous encoder; Python routes complete MPEG frames to
+            # precisely one MP3 per clock interval, even across restarts.
+            cmd += ['-write_xing', '0', '-id3v2_version', '0', '-f', 'mp3', 'pipe:1']
         else:
             cmd += ['-f', 'mp3', str(Path(c['folder']) / datetime.now().strftime(pat))]
         return cmd
@@ -422,12 +424,18 @@ class Recorder:
         use_portaudio = (self.cfg.get('source_kind') == 'device' and
                          str(self.cfg.get('source', '')).startswith('portaudio:'))
         command = self._build_command()  # validation before launching FFmpeg
+        if self._output_thread and self._output_thread.is_alive():
+            self._output_thread.join(timeout=5)
+            if self._output_thread.is_alive():
+                raise RuntimeError('Предыдущий MP3-писатель ещё завершает запись')
         if self._job_handle is not None:
             release_job(self._job_handle)  # previous encoder already stopped
             self._job_handle = None
         self.process = subprocess.Popen(command,
                                         stdin=subprocess.PIPE if use_portaudio else subprocess.DEVNULL,
-                                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                        stdout=(subprocess.PIPE if self.cfg.get('split_enabled', True)
+                                                else subprocess.DEVNULL),
+                                        stderr=subprocess.PIPE,
                                         text=True, errors='replace', bufsize=1,
                                         creationflags=flags)
         try:
@@ -436,11 +444,113 @@ class Recorder:
             self.on_status('Windows: защита от зависшего FFmpeg недоступна: ' + str(exc))
         threading.Thread(target=self._read_stderr, args=(self.process,),
                          name="ffmpeg-log", daemon=True).start()
+        if self.cfg.get('split_enabled', True):
+            self._output_thread = threading.Thread(
+                target=self._encoded_output_worker, args=(self.process,),
+                name="mp3-hourly-writer", daemon=True)
+            self._output_thread.start()
         if use_portaudio:
             proc = self.process
             self._audio_thread = threading.Thread(target=self._capture_portaudio,
                                                   args=(proc,), name='portaudio-capture', daemon=True)
             self._audio_thread.start()
+
+    def _encoded_output_worker(self, proc: subprocess.Popen) -> None:
+        """Drain FFmpeg stdout and atomically append complete MP3 frames."""
+        scanner = FrameStream()
+        try:
+            if proc.stdout is None:
+                raise RuntimeError('FFmpeg не открыл выходной MP3-поток')
+            source = getattr(proc.stdout, 'buffer', proc.stdout)
+            reader = getattr(source, 'read1', source.read)
+            while True:
+                data = reader(4096)
+                if not data:
+                    break
+                for frame, duration in scanner.feed(data):
+                    self._append_encoded_frame(frame, duration)
+        except (OSError, ValueError, RuntimeError) as exc:
+            self._output_error = str(exc)
+            self.on_status('Безопасная дозапись остановлена: ' + str(exc))
+            self.stop_requested.set()
+            if proc.poll() is None:
+                proc.terminate()
+        finally:
+            with self.lock:
+                if self._active_mp3 is not None:
+                    try:
+                        self._active_mp3.close()
+                    except OSError as exc:
+                        self.on_status('Ошибка закрытия MP3: ' + str(exc))
+                    self._active_mp3 = None
+
+    def _append_encoded_frame(self, frame: bytes, duration: float) -> None:
+        now = datetime.now()
+        minutes = int(self.cfg.get('split_minutes', 60))
+        hour = clock_boundary(now, minutes)
+        with self.lock:
+            if self._active_mp3 is None or self._active_hour != hour:
+                if self._active_mp3 is not None:
+                    self._update_current_cue()
+                    self._active_mp3.close()
+                    self._active_mp3 = None
+                fmt = format_to_strftime(self.cfg['filename_format'])
+                path = Path(self.cfg['folder']) / (hour.strftime(fmt) + '.mp3')
+                if not path.exists() and path.with_suffix('.cue').exists():
+                    raise RuntimeError('CUE существует без MP3, запись не перезаписана: ' + path.name)
+                # Check both files before opening an existing one for append.
+                saved = read_existing_cue(path.with_suffix('.cue'))
+                writer = AppendingMP3(path)
+                if saved is not None and any(
+                        offset > writer.previous_seconds + 2 for offset, _ in saved[1]):
+                    writer.close()
+                    raise ValueError('Индексы CUE выходят за пределы MP3: ' + path.name)
+                # Audio positions are contiguous, even when wall-clock capture
+                # had an outage. Shift the origin when resuming a partial hour.
+                origin = now - timedelta(seconds=writer.previous_seconds)
+                initial_title = self.last_title
+                restored: list[TrackEvent] = []
+                previous_cue = None
+                if saved is not None:
+                    initial_title, offsets, previous_cue = saved
+                    restored = [TrackEvent(origin + timedelta(seconds=offset),
+                                           title, 'resume') for offset, title in offsets][:98]
+                elif writer.previous_seconds:
+                    self.on_status('MP3 восстановлен без старого CUE: ' + path.name)
+                pending = list(self._pending_events)
+                self._pending_events.clear()
+                self._active_mp3 = writer
+                self._active_hour = hour
+                self.segment = Segment(path, origin)
+                self.events = restored
+                self.initial_title = initial_title
+                self._active_cue_text = previous_cue
+                self.last_title = restored[-1].title if restored else initial_title
+                self.on_status(('Продолжена запись: ' if writer.previous_seconds else 'Новый файл: ') + path.name)
+                if previous_cue is None:
+                    self._update_current_cue()
+                for event in pending:
+                    if event.at < origin:
+                        event = TrackEvent(origin, event.title, event.source)
+                    self._add_encoded_event(event)
+            if self._active_mp3 is not None:
+                self._active_mp3.append(frame, duration)
+                # Buffering stays bounded to FFmpeg's pipe; flush so size
+                # watchdog and archive listing see live recording progress.
+                self._active_mp3.flush()
+
+    def _add_encoded_event(self, event: TrackEvent) -> None:
+        if not self.segment or event.at < self.segment.started:
+            return
+        if event.at >= self._segment_end():
+            self._pending_events.append(event)
+            return
+        if len(self.events) < 98 and not any(
+                e.at == event.at and e.title == event.title for e in self.events):
+            self.events.append(event)
+            self.events.sort(key=lambda e: e.at)
+            self.last_title = event.title
+            self._update_current_cue()
 
     def _capture_portaudio(self, proc: subprocess.Popen) -> None:
         """Push only locally captured PCM to FFmpeg; HTTP remains metadata-only."""
@@ -529,6 +639,12 @@ class Recorder:
             if proc is not None and proc.poll() is not None:
                 # FFmpeg may have flushed a last segment during shutdown.
                 self._discover_segments()
+                if self._output_thread and self._output_thread.is_alive():
+                    self._output_thread.join(timeout=5)
+                    if self._output_thread.is_alive():
+                        self.on_status('MP3-писатель ещё занят, повторный FFmpeg не запускаем')
+                        self.stop_requested.set()
+                        break
                 if self.cfg.get('reboot_on_error'):
                     self.on_status('Ошибка записи; повторное подключение через 5 секунд')
                     if self.stop_requested.wait(5):
@@ -561,6 +677,8 @@ class Recorder:
             self.cleanup_if_due()
             self.stop_requested.wait(0.25)
         self._discover_segments()
+        if self._output_thread and self._output_thread.is_alive():
+            self._output_thread.join(timeout=5)
         with self.lock:
             self._update_current_cue()
             self._forget_active_segment()
@@ -571,6 +689,8 @@ class Recorder:
         if not self.segment or not self.cfg.get('split_enabled', True):
             return datetime.max
         minutes = int(self.cfg.get('split_minutes', 60))
+        if self._active_hour is not None:
+            return self._active_hour + timedelta(minutes=minutes)
         return clock_boundary(self.segment.started, minutes) + timedelta(minutes=minutes)
 
     def _forget_active_segment(self) -> None:
@@ -581,6 +701,7 @@ class Recorder:
         self._active_cue_text = None
         self._filename_template = None
         self._process_spawn_at = None
+        self._active_hour = None
 
     def _discover_segments(self) -> None:
         """Probe only expected FFmpeg output names, never cache the archive.
@@ -589,6 +710,9 @@ class Recorder:
         intervals. The first file may start mid-hour, so its initial timestamp
         is checked as well. No glob of thousands of archived MP3s is needed.
         """
+        if self.cfg.get('split_enabled', True):
+            # The MP3 writer already knows the active segment exactly.
+            return
         with self.lock:
             pattern = self._filename_template
             if not pattern or not self._process_spawn_at:
@@ -732,6 +856,8 @@ class Recorder:
                     self.on_status('FFmpeg не завершился штатно: ' + str(exc))
         if self.watch_thread and self.watch_thread is not threading.current_thread():
             self.watch_thread.join(timeout=3)
+        if self._output_thread and self._output_thread is not threading.current_thread():
+            self._output_thread.join(timeout=5)
         self.process = None
         if self._job_handle is not None:
             release_job(self._job_handle)
