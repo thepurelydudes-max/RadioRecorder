@@ -2,14 +2,14 @@
 
 Radio-air recording application for Windows. Two independent editions:
 
-- **Python v0.6.1 (Tkinter, current):** [editable source code](RadioRecorder/) · [Russian quick start](RadioRecorder/QUICKSTART_RU.md) · [tests](RadioRecorder/tests/).
+- **Python v0.6.2 (Tkinter, current):** [editable source code](RadioRecorder/) · [Russian quick start](RadioRecorder/QUICKSTART_RU.md) · [tests](RadioRecorder/tests/).
 - **Native 1.2 (C# / WinForms, experimental):** source archive `RadioRecorder-Native-1.2-source.zip`.
 
 ## Current Python source for Codex
 
 **Use [RadioRecorder/](RadioRecorder/) as the Python project root.** The old `RadioRecorder-Python-0.5.0-source.zip` at repository root is a historical archive, **not** the current source.
 
-Python v0.6.1 uses the selected local Windows input for MP3 recording and RadioBOSS HTTP API or ICY exclusively for track metadata. It creates hourly MP3/CUE files, manages a recording schedule, and includes file-retention and Windows-startup features.
+Python v0.6.2 uses the selected local Windows input for MP3 recording and RadioBOSS HTTP API or ICY exclusively for track metadata. It creates hourly MP3/CUE files and appends the same hour after Stop/Rec or recovery, without session suffixes. It manages a recording schedule and includes file-retention and Windows-startup features.
 
 ### Tests
 

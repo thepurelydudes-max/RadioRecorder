@@ -1,4 +1,4 @@
-"""RadioRecorder: Windows DirectShow or PortAudio -> FFmpeg continuous MP3 segment muxer.
+"""RadioRecorder: continuous Windows capture -> FFmpeg -> hourly MP3 append.
 
 All worker callbacks are invoked from background threads. Tk callbacks must be
 marshalled to the UI thread with a queue.
@@ -7,6 +7,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 import json
+import filecmp
 import tempfile
 import sys
 import os
@@ -17,7 +18,8 @@ import subprocess
 import threading
 import time
 from typing import Callable
-from cues import TrackEvent, make_cue, write_active_cue
+from cues import TrackEvent, CurrentCue
+from mp3_stream import MP3AppendFile, MP3Frame, iter_mp3_frames
 from audio_levels import peak_dbfs
 from ffmpeg_job import attach_kill_on_exit_job, release_job
 
@@ -37,6 +39,10 @@ def user_data_dir() -> Path:
 DATA_DIR = user_data_dir()
 SETTINGS_FILE = DATA_DIR / 'settings.json'
 RETENTION_STATE_FILE = DATA_DIR / 'retention_state.json'
+
+
+class _RetentionChanged(Exception):
+    """Retry an incomplete cleanup using the newly saved retention policy."""
 
 
 def atomic_json_write(path: Path, obj: dict) -> None:
@@ -219,13 +225,7 @@ def list_audio_devices(ffmpeg: str) -> list[tuple[str, str]]:
 
 def choose_output_pattern(folder: Path, fmt: str, at: datetime, minutes: int,
                           split_enabled: bool = True) -> str:
-    """Reserve an FFmpeg strftime name across upcoming boundaries.
-
-    FFmpeg owns hourly segmentation and cannot be asked to select _2 for a
-    single conflicting future hour while keeping its capture unbroken. We
-    therefore select one collision-free suffix for the current FFmpeg session.
-    Upcoming names are checked on disk once at start, not cached as a catalog.
-    """
+    """Validate unique clock-period names; reuse each period without suffixes."""
     if not split_enabled:
         stamps = [at]
         names = [at.strftime(fmt)]
@@ -247,14 +247,9 @@ def choose_output_pattern(folder: Path, fmt: str, at: datetime, minutes: int,
         if len(names) != len(set(names)):
             raise ValueError('Шаблон имени создаёт одинаковые имена для разных часов. '
                              'Добавь в формат день, месяц, год, часы и при необходимости минуты.')
-    for n in range(1, 10001):
-        suffix = '' if n == 1 else f'_{n}'
-        pattern = fmt + suffix + '.mp3'
-        if all(not (folder / (name + suffix + '.mp3')).exists()
-               and not (folder / (name + suffix + '.cue')).exists()
-               for name in names):
-            return pattern
-    raise RuntimeError('Слишком много совпадающих имён MP3/CUE в папке записи')
+    # The output worker appends only the selected clock period; no suffix is
+    # selected for either this hour or any future hour.
+    return fmt + '.mp3'
 
 
 @dataclass
@@ -293,8 +288,34 @@ class Recorder:
         self.next_warning_sent = False
         self._audio_thread: threading.Thread | None = None
         self._job_handle = None
+        self._cleanup_cancel = threading.Event()
+        self._cleanup_thread: threading.Thread | None = None
+        self._cleanup_run_lock = threading.Lock()
+        self._retention_override: tuple[bool, int] | None = None
+        self.input_overflows = 0
+        self._output_thread: threading.Thread | None = None
+        self._mp3_writer: MP3AppendFile | None = None
+        self._current_cue: CurrentCue | None = None
+        self._capture_active = False
+        self._span_wall_start: datetime | None = None
+        self._span_audio_base = 0.0
+        self._single_path: Path | None = None
+        self._observed_title_at: datetime | None = None
+
+    def update_retention(self, enabled: bool, days: int) -> None:
+        """Keep a settings save effective even while start is validating input."""
+        days = normalize_retention_days(days)
+        with self.lock:
+            self._retention_override = (enabled, days)
+            self.cfg.update(retention_enabled=enabled, retention_days=days)
 
     def start(self, config: dict, initial_title: str = "") -> None:
+        if (self._output_thread is not None and self._output_thread.is_alive()
+                and (not self.running or self.stop_requested.is_set())):
+            raise RuntimeError('Предыдущая запись MP3 ещё завершается')
+        if (self.watch_thread is not None and self.watch_thread.is_alive()
+                and self.stop_requested.is_set()):
+            raise RuntimeError('Предыдущая запись ещё завершается. Повтори запуск после её завершения.')
         if self.running:
             return
         ffmpeg = ffmpeg_path()
@@ -307,7 +328,11 @@ class Recorder:
         ensure_disk_space(output)
         if not config.get('split_enabled', True) and int(config.get('split_minutes', 60)) != 60:
             self.on_status("Разделение отключено: будет один файл")
-        self.cfg = config.copy()
+        with self.lock:
+            self.cfg = config.copy()
+            if self._retention_override is not None:
+                enabled, days = self._retention_override
+                self.cfg.update(retention_enabled=enabled, retention_days=days)
         self.recording_started = datetime.now()
         self.segment = None
         self.events.clear()
@@ -315,10 +340,15 @@ class Recorder:
         self._active_cue_text = None
         self._filename_template = None
         self._process_spawn_at = None
+        self._single_path = None
+        self._observed_title_at = None
         self.last_title = initial_title or 'Неизвестный трек'
         self.initial_title = self.last_title
         self.stop_requested.clear()
+        self._cleanup_cancel.set()
+        self._cleanup_cancel = threading.Event()
         self.next_warning_sent = False
+        self.input_overflows = 0
         self.running = True
         try:
             self._spawn()
@@ -332,7 +362,7 @@ class Recorder:
 
     def _build_command(self) -> list[str]:
         c = self.cfg
-        cmd = [ffmpeg_path(), '-hide_banner', '-nostdin', '-loglevel', 'info', '-n']
+        cmd = [ffmpeg_path(), '-hide_banner', '-nostdin', '-loglevel', 'info']
         if c.get('source_kind') == 'stream':
             cmd.extend(['-i', c['stream_url']])
         elif str(c.get('source', '')).startswith('portaudio:'):
@@ -353,24 +383,15 @@ class Recorder:
         fmt = format_to_strftime(c['filename_format'])
         now = datetime.now()
         mins = int(c.get('split_minutes', 60)) if c.get('split_enabled', True) else 60
-        # The segment muxer expands a single strftime template for the whole
-        # FFmpeg run. Reserve a collision-free suffix for the session including
-        # FUTURE hours, not just its first file. No archive is cached in RAM.
         pat = choose_output_pattern(Path(c['folder']), fmt, now, mins,
                                     bool(c.get('split_enabled', True)))
-        # Needed to find the current FFmpeg output by its predictable name;
-        # never enumerate or cache old recordings in a watch loop.
+        # Keep the validated pattern for clock-period output naming.
         self._filename_template = pat
         self._process_spawn_at = now
-        if c.get('split_enabled', True):
-            mins = int(c.get('split_minutes', 60))
-            if not 1 <= mins <= 1440:
-                raise ValueError('Неверный интервал разделения')
-            cmd += ['-f', 'segment', '-segment_format', 'mp3', '-segment_time',
-                    str(mins * 60), '-segment_atclocktime', '1',
-                    '-reset_timestamps', '1', '-strftime', '1', str(Path(c['folder']) / pat)]
-        else:
-            cmd += ['-f', 'mp3', str(Path(c['folder']) / datetime.now().strftime(pat))]
+        # Complete MP3 frames are routed to append-opened hourly files by the
+        # output worker. Each frame is independent across a clock boundary.
+        cmd += ['-reservoir', '0', '-write_xing', '0', '-id3v2_version', '0',
+                '-flush_packets', '1', '-f', 'mp3', 'pipe:1']
         return cmd
 
     def _prepare_portaudio(self) -> None:
@@ -415,6 +436,7 @@ class Recorder:
             raise RuntimeError('Не удалось инициализировать аудиовход Windows: ' + str(exc)) from exc
 
     def _spawn(self) -> None:
+        self._join_audio_output()
         if (self.cfg.get('source_kind') == 'device' and
                 str(self.cfg.get('source', '')).startswith('portaudio:')):
             self._prepare_portaudio()
@@ -427,7 +449,7 @@ class Recorder:
             self._job_handle = None
         self.process = subprocess.Popen(command,
                                         stdin=subprocess.PIPE if use_portaudio else subprocess.DEVNULL,
-                                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                         text=True, errors='replace', bufsize=1,
                                         creationflags=flags)
         try:
@@ -436,6 +458,10 @@ class Recorder:
             self.on_status('Windows: защита от зависшего FFmpeg недоступна: ' + str(exc))
         threading.Thread(target=self._read_stderr, args=(self.process,),
                          name="ffmpeg-log", daemon=True).start()
+        self._output_thread = threading.Thread(target=self._read_mp3_output,
+                                               args=(self.process,),
+                                               name='mp3-output', daemon=True)
+        self._output_thread.start()
         if use_portaudio:
             proc = self.process
             self._audio_thread = threading.Thread(target=self._capture_portaudio,
@@ -457,8 +483,16 @@ class Recorder:
             with sd.RawInputStream(samplerate=rate, device=device_id,
                                    channels=channels, dtype='int16', blocksize=1024) as stream:
                 last_meter = 0.0
+                last_overflow_warning = float('-inf')
                 while not self.stop_requested.is_set() and proc.poll() is None:
                     data, overflow = stream.read(1024)
+                    if overflow:
+                        self.input_overflows += 1
+                        now = time.monotonic()
+                        if now - last_overflow_warning >= 60:
+                            last_overflow_warning = now
+                            self.on_status('Переполнение аудиобуфера Windows/PortAudio: '
+                                           f'возможны пропуски звука (событий: {self.input_overflows})')
                     if time.monotonic() - last_meter >= 0.12:
                         last_meter = time.monotonic()
                         self.on_meter(peak_dbfs(data))
@@ -480,34 +514,66 @@ class Recorder:
         if process.stderr is None:
             return
         recent_lines: list[str] = []
-        for line in process.stderr:
-            line = line.strip()
-            if not line:
-                continue
-            recent_lines.append(line)
-            if len(recent_lines) > 8:
-                recent_lines.pop(0)
-            # EBU loudness is approximate indication, not a calibrated dBFS VU.
-            meter = re.search(r'FTPK:\s*(-?\d+(?:\.\d+)?)', line)
-            if meter:
-                try:
-                    self.on_meter(float(meter.group(1)))
-                except ValueError:
-                    pass
-            if 'silence_start:' in line:
-                self.on_status('Обнаружена тишина: ' + line.split('silence_start:')[-1].strip())
-                if time.monotonic() - self.last_silence_alert >= 60:
-                    self.last_silence_alert = time.monotonic()
-                    self.on_silence()
-            if any(s in line.lower() for s in ('error opening input', 'error opening output',
-                                                 'could not find', 'invalid argument',
-                                                 'cannot open', 'no such device',
-                                                 'permission denied', 'device busy')):
-                self.on_status('FFmpeg: ' + line[-220:])
+        try:
+            for line in process.stderr:
+                line = line.strip()
+                if not line:
+                    continue
+                recent_lines.append(line)
+                if len(recent_lines) > 8:
+                    recent_lines.pop(0)
+                # EBU loudness is approximate indication, not a calibrated dBFS VU.
+                meter = re.search(r'FTPK:\s*(-?\d+(?:\.\d+)?)', line)
+                if meter:
+                    try:
+                        self.on_meter(float(meter.group(1)))
+                    except ValueError:
+                        pass
+                if 'silence_start:' in line:
+                    self.on_status('Обнаружена тишина: ' + line.split('silence_start:')[-1].strip())
+                    if time.monotonic() - self.last_silence_alert >= 60:
+                        self.last_silence_alert = time.monotonic()
+                        self.on_silence()
+                if any(s in line.lower() for s in ('error opening input', 'error opening output',
+                                                     'could not find', 'invalid argument',
+                                                     'cannot open', 'no such device',
+                                                     'permission denied', 'device busy')):
+                    self.on_status('FFmpeg: ' + line[-220:])
+        finally:
+            process.stderr.close()
         if process.poll() and not self.stop_requested.is_set():
             self.on_status('FFmpeg завершился: ' + ' | '.join(recent_lines[-3:])[-380:])
 
     def _watch(self) -> None:
+        """Always retire a failed session, including unexpected filesystem errors."""
+        try:
+            self._start_cleanup_worker()
+            self._watch_loop()
+        except Exception as exc:
+            self.on_status('Ошибка наблюдения за записью: ' + str(exc))
+        finally:
+            self.stop_requested.set()
+            self._cleanup_cancel.set()
+            try:
+                proc = self.process
+                if proc is not None:
+                    self._stop_encoder(proc)
+            except Exception as exc:
+                self.on_status('Ошибка завершения FFmpeg: ' + str(exc))
+            try:
+                self._join_audio_output()
+                self._sync_output()
+                with self.lock:
+                    self._update_current_cue()
+            except Exception as exc:
+                self.on_status('Ошибка завершения записи: ' + str(exc))
+            finally:
+                if self._output_thread is None or not self._output_thread.is_alive():
+                    with self.lock:
+                        self._forget_active_segment()
+                self.running = False
+
+    def _watch_loop(self) -> None:
         last_bytes = -1
         last_growth = time.monotonic()
         next_disk_check = time.monotonic()
@@ -528,7 +594,7 @@ class Recorder:
             proc = self.process
             if proc is not None and proc.poll() is not None:
                 # FFmpeg may have flushed a last segment during shutdown.
-                self._discover_segments()
+                self._sync_output()
                 if self.cfg.get('reboot_on_error'):
                     self.on_status('Ошибка записи; повторное подключение через 5 секунд')
                     if self.stop_requested.wait(5):
@@ -541,7 +607,7 @@ class Recorder:
                     continue
                 self.on_status('Запись остановлена из-за ошибки FFmpeg')
                 break
-            self._discover_segments()
+            self._sync_output()
             # MP3 output should grow even when source sound is silent.
             try:
                 current_file = self.segment.path if self.segment else None
@@ -558,13 +624,24 @@ class Recorder:
                 last_growth = time.monotonic()
             if self.recording_started:
                 self.on_elapsed((datetime.now() - self.recording_started).total_seconds())
-            self.cleanup_if_due()
             self.stop_requested.wait(0.25)
-        self._discover_segments()
-        with self.lock:
-            self._update_current_cue()
-            self._forget_active_segment()
-        self.running = False
+
+    def _start_cleanup_worker(self) -> None:
+        """Slow archive scans must never delay segment discovery or metadata."""
+        cancel = self._cleanup_cancel
+
+        def cleanup_worker():
+            while not cancel.is_set():
+                try:
+                    self.cleanup_if_due(cancel=cancel)
+                except Exception as exc:
+                    self.on_status('Ошибка фоновой автоочистки: ' + str(exc))
+                if cancel.wait(1):
+                    break
+
+        self._cleanup_thread = threading.Thread(target=cleanup_worker,
+                                                name='archive-cleanup', daemon=True)
+        self._cleanup_thread.start()
 
     def _segment_end(self) -> datetime:
         """Boundary of the active MP3; later metadata belongs to the NEXT CUE."""
@@ -581,79 +658,133 @@ class Recorder:
         self._active_cue_text = None
         self._filename_template = None
         self._process_spawn_at = None
+        self._current_cue = None
 
-    def _discover_segments(self) -> None:
-        """Probe only expected FFmpeg output names, never cache the archive.
-
-        The segment muxer generates filenames using strftime and local clock
-        intervals. The first file may start mid-hour, so its initial timestamp
-        is checked as well. No glob of thousands of archived MP3s is needed.
-        """
+    def _sync_output(self) -> None:
+        """Flush the one active output; never enumerate the archive."""
         with self.lock:
-            pattern = self._filename_template
-            if not pattern or not self._process_spawn_at:
-                return
-            now = datetime.now()
-            folder = Path(self.cfg['folder'])
-            moments = [self._process_spawn_at]
-            if self.cfg.get('split_enabled', True):
-                minutes = int(self.cfg.get('split_minutes', 60))
-                boundary = clock_boundary(now, minutes)
-                moments += [boundary, boundary - timedelta(minutes=minutes)]
-                # The first output or a reconnect may appear after the minute
-                # recorded just before Popen; check 'now' only in that case.
-                if self.segment is None or self._process_spawn_at > self.segment.started:
-                    moments.append(now)
-            elif self.segment is None:
-                moments.append(now)
-            # Prefer the most recent existing file and avoid duplicate paths.
-            choices: dict[Path, datetime] = {}
-            for stamp in moments:
-                path = folder / stamp.strftime(pattern)
-                if path not in choices:
-                    choices[path] = stamp
-            selected = None
-            for path, stamp in sorted(choices.items(), key=lambda entry: entry[1], reverse=True):
-                if self.segment is not None and path == self.segment.path:
-                    continue
-                try:
-                    if path.is_file() and path.stat().st_size > 0:
-                        selected = path, stamp
-                        break
-                except OSError:
-                    continue
-            if selected is None:
-                return
-            path, stamp = selected
-            if self.segment is not None:
-                # Old files cannot become the active recording again.
-                if stamp <= self.segment.started:
-                    return
-                boundary = clock_boundary(now, int(self.cfg.get('split_minutes', 60)))
-                spawned_path = folder / self._process_spawn_at.strftime(pattern)
-                if path == spawned_path and self._process_spawn_at > self.segment.started:
-                    start = self._process_spawn_at  # FFmpeg restarted mid-hour
-                elif boundary > self.segment.started:
-                    start = boundary
-                else:
-                    return
-                # Old CUE has already been saved on each accepted event.
-                # Never touch it once a new MP3 has appeared.
-                before = [e for e in self.events if e.at < start]
-                initial_title = before[-1].title if before else self.initial_title
-                carry = [e for e in self.events if e.at >= start]
-                carry += [e for e in self._pending_events if e.at >= start]
+            if self._mp3_writer is not None:
+                self._mp3_writer.flush()
+
+    def _join_audio_output(self) -> None:
+        worker = self._output_thread
+        if worker is not None and worker is not threading.current_thread():
+            worker.join(timeout=3)
+            if worker.is_alive():
+                raise RuntimeError('Запись MP3 ещё завершается; дождись окончания записи')
+
+    def _close_audio_output(self) -> None:
+        with self.lock:
+            self._capture_active = False
+            writer, self._mp3_writer = self._mp3_writer, None
+            try:
+                if writer is not None:
+                    writer.close()
+            finally:
+                self._update_current_cue()
+
+    def _write_mp3_frame(self, frame: MP3Frame, at: datetime) -> None:
+        """Route a complete independent frame into its clock period's MP3."""
+        with self.lock:
+            frame_written = False
+            split = self.cfg.get('split_enabled', True)
+            bucket = clock_boundary(at, int(self.cfg.get('split_minutes', 60))) if split else None
+            fmt = format_to_strftime(self.cfg['filename_format'])
+            if split:
+                path = Path(self.cfg['folder']) / (bucket.strftime(fmt) + '.mp3')
             else:
-                start = self._process_spawn_at
-                initial_title = self.initial_title
-                carry = [e for e in self._pending_events if e.at >= start]
-            self.segment = Segment(path, start)
-            self.initial_title = initial_title
-            self.events = sorted(carry, key=lambda e: e.at)[:98]
-            self._pending_events.clear()
-            self._active_cue_text = None
-            self.on_status('Новый файл: ' + path.name)
+                if self._single_path is None:
+                    stamp = self.recording_started or self._process_spawn_at or at
+                    self._single_path = Path(self.cfg['folder']) / (stamp.strftime(fmt) + '.mp3')
+                path = self._single_path
+            if self._mp3_writer is None or self.segment is None or self.segment.path != path:
+                self._close_audio_output()
+                if path.is_symlink():
+                    raise ValueError('MP3 является символической ссылкой; запись в него запрещена')
+                cue_path = path.with_suffix('.cue')
+                if (not path.exists() or path.stat().st_size == 0) and cue_path.exists():
+                    # The metadata cannot describe a new audio timeline. Keep
+                    # it recoverable, then create a fresh zero-based CUE.
+                    backup = cue_path.with_suffix('.cue.orphan')
+                    if not backup.exists() or not filecmp.cmp(cue_path, backup, shallow=False):
+                        if backup.exists():
+                            target = tempfile.NamedTemporaryFile(
+                                prefix=cue_path.name + '.orphan-', suffix='.bak',
+                                dir=cue_path.parent, delete=False)
+                            backup = Path(target.name)
+                        else:
+                            target = backup.open('xb')
+                        with target:
+                            with cue_path.open('rb') as source:
+                                shutil.copyfileobj(source, target)
+                            target.flush()
+                            os.fsync(target.fileno())
+                    cue_path.unlink()
+                    self.on_status('MP3 отсутствует: прежний CUE сохранён в ' + backup.name)
+                cue = CurrentCue(cue_path, path.name, at.year)
+                writer = MP3AppendFile(path, frame.sample_rate, frame.channels)
+                try:
+                    span_start = max(bucket, self._process_spawn_at or at) if split else (self._process_spawn_at or at)
+                    audio_base = writer.duration
+                    cue.resume(span_start, audio_base, self.last_title)
+                    # Validate and persist the first resumed frame before any
+                    # CUE seam can claim that this capture has actually begun.
+                    writer.write(frame)
+                    writer.sync()
+                    cue.save()
+                except Exception:
+                    writer.close()
+                    raise
+                self._mp3_writer = writer
+                self._current_cue = cue
+                self._span_wall_start = span_start
+                self._span_audio_base = audio_base
+                self.segment = Segment(path, bucket or span_start)
+                self.events.clear()
+                self._capture_active = True
+                self.on_status(('Продолжение файла: ' if audio_base else 'Новый файл: ') + path.name)
+                frame_written = True
+            if not frame_written:
+                self._mp3_writer.write(frame)
+            self._apply_pending_events()
+
+    def _apply_pending_events(self) -> None:
+        """Never persist a CUE index for audio the encoder has not delivered."""
+        if self._current_cue is None or self._mp3_writer is None:
+            return
+        pending, self._pending_events = self._pending_events, []
+        changed = False
+        for event in sorted(pending, key=lambda item: item.at):
+            position = self._span_audio_base + max(0, (event.at - self._span_wall_start).total_seconds())
+            if event.at >= self._segment_end() or position > self._mp3_writer.duration:
+                self._pending_events.append(event)
+            else:
+                changed = self._current_cue.add_event(event) or changed
+        if changed:
             self._update_current_cue()
+
+    def _read_mp3_output(self, proc: subprocess.Popen) -> None:
+        try:
+            if proc.stdout is None:
+                raise RuntimeError('Не открыт выход MP3 для FFmpeg')
+            source = getattr(proc.stdout, 'buffer', proc.stdout)
+            for frame in iter_mp3_frames(source):
+                self._write_mp3_frame(frame, datetime.now())
+        except Exception as exc:
+            if not self.stop_requested.is_set():
+                self.on_status('Ошибка записи MP3: ' + str(exc))
+            if proc.poll() is None:
+                try:
+                    proc.terminate()
+                except OSError:
+                    pass  # watcher owns the bounded termination/kill fallback
+        finally:
+            try:
+                self._close_audio_output()
+            except Exception as exc:
+                self.on_status('Ошибка завершения MP3/CUE: ' + str(exc))
+            if proc.stdout is not None:
+                proc.stdout.close()
 
     def add_event(self, event: TrackEvent) -> None:
         with self.lock:
@@ -666,72 +797,56 @@ class Recorder:
             shifted = TrackEvent(event.at + timedelta(seconds=sec), event.title, event.source)
             if not shifted.title.strip():
                 return
-            # The hour may have just changed; find the new MP3 first.
-            self._discover_segments()
-            if self.segment is None:
+            span_start = self._span_wall_start if self._capture_active else self._process_spawn_at
+            observed = shifted.at
+            if span_start is not None and observed < span_start:
+                observed = span_start if event.source == 'API playbackinfo' else None
+            if observed is not None and (self._observed_title_at is None or observed >= self._observed_title_at):
+                self._observed_title_at = observed
                 self.last_title = shifted.title
-                self.initial_title = shifted.title
+            # Metadata received while reconnecting seeds the next capture span,
+            # but may not invent audio or CUE tracks during the interruption.
+            if not self._capture_active or self._current_cue is None:
+                self._pending_events.append(shifted)
+                self._pending_events = self._pending_events[-98:]
                 return
-            if shifted.at < self.segment.started:
-                # A track started before this recording may still be playing.
-                # Playbackinfo identifies it without touching any older CUE.
-                if (event.source == 'API playbackinfo'
-                        and shifted.title != self.initial_title):
-                    self.initial_title = shifted.title
-                    self.last_title = shifted.title
-                    self._update_current_cue()
-                return
-            if shifted.at >= self._segment_end():
-                # Audio muxer may be milliseconds behind ICY/API event. Hold
-                # just a few new-hour events until its new output is visible.
-                if not any(e.at == shifted.at and e.title == shifted.title for e in self._pending_events):
-                    self._pending_events.append(shifted)
-                    self._pending_events = sorted(self._pending_events, key=lambda e: e.at)[-98:]
-                self.last_title = shifted.title
-                return
-            if any(e.at == shifted.at and e.title == shifted.title for e in self.events):
-                return
-            if len(self.events) >= 98:
-                # CUE format allows 99 tracks including the initial one.
-                self.last_title = shifted.title
-                return
-            self.events.append(shifted)
-            self.events.sort(key=lambda e: e.at)
-            self.last_title = self.events[-1].title
-            self._update_current_cue()
+            self._pending_events.append(shifted)
+            self._pending_events = self._pending_events[-98:]
+            self._apply_pending_events()
 
     def _update_current_cue(self) -> None:
-        """Only edit the open hour's CUE, preserving its Windows creation time."""
-        if self.segment is None:
-            return
-        cue_text = make_cue(self.segment.path.name, self.segment.started,
-                            self._segment_end(), self.events,
-                            initial_title=self.initial_title)
-        if cue_text == self._active_cue_text:
-            return
+        if self._current_cue is not None:
+            if self._mp3_writer is not None:
+                self._mp3_writer.sync()
+            self._current_cue.save()
+
+    def _stop_encoder(self, proc: subprocess.Popen) -> None:
+        """Use the same bounded termination and kill fallback on every exit."""
         try:
-            write_active_cue(self.segment.path.with_suffix('.cue'), cue_text, self._active_cue_text)
-            self._active_cue_text = cue_text
-        except OSError as exc:
-            self.on_status('Ошибка CUE: ' + str(exc))
+            if proc.poll() is None:
+                proc.terminate()
+            proc.wait(timeout=4)
+        except (OSError, subprocess.TimeoutExpired):
+            try:
+                if proc.poll() is None:
+                    proc.kill()
+                proc.wait(timeout=2)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                # Retain ownership so a later Stop/close can retry rather than
+                # launch another encoder or hide a still-running process.
+                raise RuntimeError('FFmpeg не завершился штатно: ' + str(exc)) from exc
 
     def stop(self) -> None:
         self.stop_requested.set()
+        self._cleanup_cancel.set()
         proc = self.process
         if proc is not None:
-            try:
-                if proc.poll() is None:
-                    proc.terminate()
-                proc.wait(timeout=4)
-            except (OSError, subprocess.TimeoutExpired):
-                try:
-                    if proc.poll() is None:
-                        proc.kill()
-                    proc.wait(timeout=2)
-                except (OSError, subprocess.TimeoutExpired) as exc:
-                    self.on_status('FFmpeg не завершился штатно: ' + str(exc))
+            self._stop_encoder(proc)
         if self.watch_thread and self.watch_thread is not threading.current_thread():
             self.watch_thread.join(timeout=3)
+            if self.watch_thread.is_alive():
+                raise RuntimeError('Поток записи ещё завершается; новый сеанс пока недоступен')
+        self._join_audio_output()
         self.process = None
         if self._job_handle is not None:
             release_job(self._job_handle)
@@ -742,19 +857,26 @@ class Recorder:
             self._forget_active_segment()
         self.on_status('Запись остановлена')
 
-    def cleanup_if_due(self, now: datetime | None = None) -> bool:
+    def cleanup_if_due(self, now: datetime | None = None, *,
+                       cancel: threading.Event | None = None) -> bool:
         """Do cleanup at most once per local calendar day while recording.
 
         The daily check runs when recording starts (if not yet done today),
         and again after each subsequent midnight while recording remains on.
         An atomic state file prevents another cleanup after an app restart.
         """
-        if not self.running or not self.cfg.get('retention_enabled', False):
+        if cancel is not None and cancel.is_set():
             return False
-        now = now or datetime.now()
-        folder = Path(self.cfg['folder']).expanduser().resolve()
-        key = str(folder).casefold() if os.name == 'nt' else str(folder)
-        with self.lock:
+        with self._cleanup_run_lock:
+            if cancel is not None and cancel.is_set():
+                return False
+            with self.lock:
+                config = self.cfg.copy()
+                if not self.running or not config.get('retention_enabled', False):
+                    return False
+            now = now or datetime.now()
+            folder = Path(config['folder']).expanduser().resolve()
+            key = str(folder).casefold() if os.name == 'nt' else str(folder)
             desired_state = {'folder': key, 'date': now.date().isoformat()}
             if getattr(self, '_retention_last_in_memory', None) == desired_state:
                 return False
@@ -770,11 +892,15 @@ class Recorder:
                 self._retention_last_in_memory = desired_state
                 return False
             try:
-                deleted = self.cleanup_old(now)
+                deleted = self.cleanup_old(now, config=config, cancel=cancel)
+            except _RetentionChanged:
+                return False
             except (OSError, ValueError) as exc:
                 self._retention_retry_after = time.monotonic() + 300  # avoid repeating errors
                 self.on_status('Автоочистка не завершена: ' + str(exc))
                 return False
+            if cancel is not None and cancel.is_set():
+                return False  # partial/cancelled scans must be retried
             # Persist only when deletion scanning completed; log any I/O
             # error, but suppress repeated scans in this process.
             state = desired_state
@@ -786,18 +912,22 @@ class Recorder:
             self.on_status(f'Ежедневная автоочистка: удалено файлов: {deleted}')
             return True
 
-    def cleanup_old(self, now: datetime | None = None) -> int:
+    def cleanup_old(self, now: datetime | None = None, *, config: dict | None = None,
+                    cancel: threading.Event | None = None) -> int:
         """Delete only expired MP3/CUE files in the recordings directory.
 
         Retention uses whole calendar days: before midnight (today - N days).
         Never recurse, follow symlinks, or delete an open audio/CUE file.
         Call directly for tests; normal operation goes via cleanup_if_due().
         """
-        if not self.cfg.get('retention_enabled', False):
+        if config is None:
+            with self.lock:
+                config = self.cfg.copy()
+        if not config.get('retention_enabled', False):
             return 0
         now = now or datetime.now()
-        days = normalize_retention_days(self.cfg.get('retention_days', 90))
-        folder = Path(self.cfg.get('folder', '')).expanduser().resolve()
+        days = normalize_retention_days(config.get('retention_days', 90))
+        folder = Path(config.get('folder', '')).expanduser().resolve()
         if (not folder.is_dir() or folder == folder.parent or
             folder == Path.home().resolve() or
             folder == APP_DIR.resolve() or folder in APP_DIR.resolve().parents):
@@ -805,22 +935,33 @@ class Recorder:
         deadline = (now.replace(hour=0, minute=0, second=0, microsecond=0)
                     - timedelta(days=days)).timestamp()
         count = 0
-        with self.lock:
-            # Only the currently open MP3/CUE are protected. Past hours are
-            # never held in the Recorder or modified during cleanup.
-            active = {self.segment.path.resolve(), self.segment.path.with_suffix('.cue').resolve()} if self.segment else set()
-            for file in folder.iterdir():
-                if (file.is_symlink() or not file.is_file() or
-                        file.suffix.lower() not in ('.mp3', '.cue') or
-                        file.resolve() in active):
+        for file in folder.iterdir():
+            if cancel is not None and cancel.is_set():
+                break
+            if file.suffix.lower() not in ('.mp3', '.cue'):
+                continue
+            try:
+                if file.is_symlink() or not file.is_file() or file.stat().st_mtime >= deadline:
                     continue
-                try:
-                    if file.stat().st_mtime < deadline:
-                        file.unlink()
-                        count += 1
-                        self.on_status('Удалён старый файл: ' + file.name)
-                except OSError as exc:
-                    self.on_status('Автоудаление ' + file.name + ': ' + str(exc))
+                resolved = file.resolve()
+                # The active segment may change during the scan. Recheck at
+                # deletion time; never hold this lock over directory iteration.
+                with self.lock:
+                    if cancel is not None and cancel.is_set():
+                        break
+                    if cancel is not None and any(self.cfg.get(key) != config.get(key)
+                            for key in ('folder', 'retention_enabled', 'retention_days')):
+                        raise _RetentionChanged()
+                    active = ({self.segment.path.resolve(),
+                               self.segment.path.with_suffix('.cue').resolve()}
+                              if self.segment else set())
+                    if resolved in active or file.is_symlink() or file.stat().st_mtime >= deadline:
+                        continue
+                    file.unlink()
+                count += 1
+                self.on_status('Удалён старый файл: ' + file.name)
+            except OSError as exc:
+                self.on_status('Автоудаление ' + file.name + ': ' + str(exc))
         return count
 
 
@@ -844,3 +985,4 @@ def auto_should_start(cfg: dict, now: datetime,
 def is_schedule_active(cfg: dict, at: datetime | None = None) -> bool:
     at = at or datetime.now()
     return bool(cfg.get('schedule', DEFAULTS['schedule'])[at.weekday()][at.hour])
+

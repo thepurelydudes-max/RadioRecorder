@@ -19,7 +19,9 @@ class CleanupSafetyTests(unittest.TestCase):
     def test_only_mp3_and_cue_deleted_non_matching_files_untouched(self):
         with tempfile.TemporaryDirectory() as d:
             folder = Path(d)
-            values = ['old.mp3', 'old.cue', 'old.MP3', 'old.CUE',
+            # Distinct stems matter on Windows: old.mp3 and old.MP3 are the
+            # same file on its normal case-insensitive filesystem.
+            values = ['old.mp3', 'old.cue', 'uppercase.MP3', 'uppercase.CUE',
                       'notes.txt', 'config.json', 'old.mp3.tmp', 'playlist.m3u']
             cutoff = time.time() - 95*86400
             for name in values:
@@ -43,26 +45,31 @@ class NamingSafetyTests(unittest.TestCase):
         self.at = datetime(2026, 10, 27, 18, 25)
         self.fmt = format_to_strftime('%d-%m-%y_%hh-%mm')
 
-    def test_future_19_00_collision_reserves_suffix_before_18_00_start(self):
+    def test_future_hour_keeps_base_pattern_and_archive_untouched(self):
         old = self.folder / '27-10-2026_19-00.mp3'
         old.write_bytes(b'OLD_MP3_DO_NOT_TOUCH')
         cue = old.with_suffix('.cue')
         cue.write_bytes(b'OLD_CUE_DO_NOT_TOUCH')
         pattern = choose_output_pattern(self.folder, self.fmt, self.at, 60)
-        self.assertEqual(pattern, self.fmt + '_2.mp3')
+        self.assertEqual(pattern, self.fmt + '.mp3')
         self.assertEqual(old.read_bytes(), b'OLD_MP3_DO_NOT_TOUCH')
         self.assertEqual(cue.read_bytes(), b'OLD_CUE_DO_NOT_TOUCH')
 
-    def test_suffix_three_if_two_occupied_even_if_only_future_hour(self):
+    def test_legacy_suffixes_do_not_change_base_pattern(self):
         for suffix in ['', '_2']:
             (self.folder / f'27-10-2026_19-00{suffix}.mp3').write_bytes(b'a')
         pattern = choose_output_pattern(self.folder, self.fmt, self.at, 60)
-        self.assertEqual(pattern, self.fmt + '_3.mp3')
+        self.assertEqual(pattern, self.fmt + '.mp3')
+        for suffix in ['', '_2']:
+            self.assertEqual((self.folder / f'27-10-2026_19-00{suffix}.mp3').read_bytes(), b'a')
+        self.assertFalse((self.folder / '27-10-2026_19-00_3.mp3').exists())
 
-    def test_collision_with_cue_alone_protected(self):
-        (self.folder / '27-10-2026_19-00.cue').write_text('OLD')
+    def test_cue_alone_keeps_base_pattern_and_cue_untouched(self):
+        cue = self.folder / '27-10-2026_19-00.cue'
+        cue.write_text('OLD', encoding='utf-8')
         self.assertEqual(choose_output_pattern(self.folder, self.fmt, self.at, 60),
-                         self.fmt + '_2.mp3')
+                         self.fmt + '.mp3')
+        self.assertEqual(cue.read_text(encoding='utf-8'), 'OLD')
 
     def test_at_exact_clock_boundary_no_false_duplicate(self):
         self.assertEqual(choose_output_pattern(self.folder, self.fmt,
@@ -79,14 +86,16 @@ class NamingSafetyTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'одинаковые имена'):
             choose_output_pattern(self.folder, pattern, self.at, 60)
 
-    def test_when_no_segmentation_off_only_current_name_matters(self):
+    def test_without_segmentation_existing_name_keeps_base_pattern(self):
         p = self.folder / '27-10-2026_18-25.mp3'
         p.write_bytes(b'old')
         self.assertEqual(choose_output_pattern(self.folder, self.fmt,
-                                               self.at, 60, False), self.fmt+'_2.mp3')
+                                               self.at, 60, False), self.fmt+'.mp3')
+        self.assertEqual(p.read_bytes(), b'old')
 
-    def test_ffmpeg_command_uses_session_suffix_for_all_hours(self):
-        (self.folder / '27-10-2026_19-00.mp3').write_bytes(b'old')
+    def test_ffmpeg_pipes_audio_without_changing_future_archive(self):
+        old = self.folder / '27-10-2026_19-00.mp3'
+        old.write_bytes(b'old')
         recorder = Recorder(lambda _: None)
         recorder.cfg = {
             'folder': str(self.folder), 'filename_format': '%d-%m-%y_%hh-%mm',
@@ -96,8 +105,10 @@ class NamingSafetyTests(unittest.TestCase):
         with patch('engine.datetime', wraps=datetime) as clock, patch('engine.ffmpeg_path', return_value='ffmpeg.exe'):
             clock.now.return_value = self.at
             cmd = recorder._build_command()
-        self.assertTrue(cmd[-1].endswith('_2.mp3'))
-        self.assertEqual(cmd[cmd.index('-segment_atclocktime')+1], '1')
+        self.assertEqual(cmd[-1], 'pipe:1')
+        self.assertEqual(recorder._filename_template, self.fmt + '.mp3')
+        self.assertNotIn('-segment_atclocktime', cmd)
+        self.assertEqual(old.read_bytes(), b'old')
 
 
 class USBReenumerationTests(unittest.TestCase):
@@ -199,3 +210,4 @@ class DiskHeadroomTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
