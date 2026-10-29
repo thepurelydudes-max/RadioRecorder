@@ -49,7 +49,7 @@ class NamingSafetyTests(unittest.TestCase):
         cue = old.with_suffix('.cue')
         cue.write_bytes(b'OLD_CUE_DO_NOT_TOUCH')
         pattern = choose_output_pattern(self.folder, self.fmt, self.at, 60)
-        self.assertEqual(pattern, self.fmt + '_2.mp3')
+        self.assertEqual(pattern, self.fmt + '.mp3')
         self.assertEqual(old.read_bytes(), b'OLD_MP3_DO_NOT_TOUCH')
         self.assertEqual(cue.read_bytes(), b'OLD_CUE_DO_NOT_TOUCH')
 
@@ -57,12 +57,12 @@ class NamingSafetyTests(unittest.TestCase):
         for suffix in ['', '_2']:
             (self.folder / f'27-10-2026_19-00{suffix}.mp3').write_bytes(b'a')
         pattern = choose_output_pattern(self.folder, self.fmt, self.at, 60)
-        self.assertEqual(pattern, self.fmt + '_3.mp3')
+        self.assertEqual(pattern, self.fmt + '.mp3')
 
     def test_collision_with_cue_alone_protected(self):
         (self.folder / '27-10-2026_19-00.cue').write_text('OLD')
         self.assertEqual(choose_output_pattern(self.folder, self.fmt, self.at, 60),
-                         self.fmt + '_2.mp3')
+                         self.fmt + '.mp3')
 
     def test_at_exact_clock_boundary_no_false_duplicate(self):
         self.assertEqual(choose_output_pattern(self.folder, self.fmt,
@@ -96,8 +96,10 @@ class NamingSafetyTests(unittest.TestCase):
         with patch('engine.datetime', wraps=datetime) as clock, patch('engine.ffmpeg_path', return_value='ffmpeg.exe'):
             clock.now.return_value = self.at
             cmd = recorder._build_command()
-        self.assertTrue(cmd[-1].endswith('_2.mp3'))
-        self.assertEqual(cmd[cmd.index('-segment_atclocktime')+1], '1')
+        self.assertEqual(cmd[-1], 'pipe:1')
+        self.assertIn('-write_xing', cmd)
+        self.assertEqual(cmd[cmd.index('-id3v2_version')+1], '0')
+        self.assertIsNone(recorder._filename_template)
 
 
 class USBReenumerationTests(unittest.TestCase):
