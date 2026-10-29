@@ -19,7 +19,9 @@ class CleanupSafetyTests(unittest.TestCase):
     def test_only_mp3_and_cue_deleted_non_matching_files_untouched(self):
         with tempfile.TemporaryDirectory() as d:
             folder = Path(d)
-            values = ['old.mp3', 'old.cue', 'old.MP3', 'old.CUE',
+            # Distinct stems matter on Windows: old.mp3 and old.MP3 are the
+            # same file on its normal case-insensitive filesystem.
+            values = ['old.mp3', 'old.cue', 'uppercase.MP3', 'uppercase.CUE',
                       'notes.txt', 'config.json', 'old.mp3.tmp', 'playlist.m3u']
             cutoff = time.time() - 95*86400
             for name in values:
@@ -199,3 +201,4 @@ class DiskHeadroomTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
