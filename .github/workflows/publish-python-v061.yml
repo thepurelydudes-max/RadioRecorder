@@ -1,0 +1,41 @@
+name: Publish RadioRecorder Python v0.6.1 sources
+
+on:
+  push:
+    paths:
+      - '.github/scripts/import_v061.py'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish-python-sources:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Reconstruct and verify v0.6.1 sources
+        run: python .github/scripts/import_v061.py
+      - name: Run RadioRecorder Python tests
+        run: |
+          cd RadioRecorder
+          python -m pip install -r requirements.txt
+          python -m unittest discover -s tests -q
+      - name: Commit unpacked sources
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add RadioRecorder
+          if git diff --cached --quiet; then
+            echo 'No source changes to commit'
+          else
+            git commit -m 'Publish RadioRecorder Python v0.6.1 source files and tests'
+            git push origin HEAD:main
+          fi
