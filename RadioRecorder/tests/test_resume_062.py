@@ -104,6 +104,9 @@ class HourlyResumeTests(unittest.TestCase):
             saved = self.folder/'29-10-2026_18-00.mp3'
             original = saved.read_bytes()
             old_cue = saved.with_suffix('.cue').read_bytes()
+            self.assertTrue(old_cue.startswith(b'\xef\xbb\xbfREM DATE '), repr(old_cue[:300]))
+            self.assertIsNotNone(read_existing_cue(saved.with_suffix('.cue')),
+                                 repr(old_cue[:500]))
 
             recovered = self._recorder()
             clock.now.return_value = start + timedelta(minutes=2)
