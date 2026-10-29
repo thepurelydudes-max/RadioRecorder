@@ -113,9 +113,9 @@ def read_existing_cue(path: Path) -> tuple[str, list[tuple[float, str]], str] | 
         return None
     text = path.read_text(encoding='utf-8-sig')
     tracks = re.findall(
-        r'(?m)^  TRACK (\\d{2}) AUDIO\\r?\\n'
-        r'    TITLE "([^"\\r\\n]*)"\\r?\\n'
-        r'    INDEX 01 (\\d+):(\\d{2}):(\\d{2})',
+        r'(?m)^  TRACK (\d{2}) AUDIO\r?\n'
+        r'    TITLE "([^"\r\n]*)"\r?\n'
+        r'    INDEX 01 (\d+):(\d{2}):(\d{2})',
         text)
     if not tracks or not text.startswith('REM DATE '):
         raise ValueError('Невозможно восстановить существующий CUE: ' + path.name)
