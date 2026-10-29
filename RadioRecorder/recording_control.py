@@ -72,9 +72,11 @@ class RecordingControl:
             except Exception as exc:
                 errors.append(str(exc))
         watcher = getattr(self.recorder, 'watch_thread', None)
+        output = getattr(self.recorder, '_output_thread', None)
         proc = self.recorder.process
         self._active = bool(self.recorder.running or
                             (watcher is not None and watcher.is_alive()) or
+                            (output is not None and output.is_alive()) or
                             (proc is not None and proc.poll() is None))
         return '; '.join(errors) or None
 

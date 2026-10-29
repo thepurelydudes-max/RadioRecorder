@@ -10,6 +10,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from engine import DEFAULTS, Recorder, Segment, choose_output_pattern
+from mp3_stream import MP3AppendFile, MP3FormatError
 
 
 class NamingOptimizationTests(unittest.TestCase):
@@ -21,28 +22,49 @@ class NamingOptimizationTests(unittest.TestCase):
             self.assertEqual(result, '%d-%m-%Y_%H-%M.mp3')
             self.assertLess(exists.call_count, 10)
 
-    def test_directory_and_valid_symlink_names_remain_occupied(self):
+    def test_directory_target_cannot_be_written_or_select_suffix(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             (root / '29-10-2026_13-00.cue').mkdir()
+            directory = root / '29-10-2026_13-00.mp3'
+            directory.mkdir()
+            marker = directory / 'keep.txt'
+            marker.write_bytes(b'archive')
+            self.assertEqual(choose_output_pattern(root, '%d-%m-%Y_%H-%M',
+                             datetime(2026, 10, 29, 12, 15), 60),
+                             '%d-%m-%Y_%H-%M.mp3')
+            with self.assertRaises(OSError):
+                MP3AppendFile(directory, 48000, 1)
+            self.assertEqual(marker.read_bytes(), b'archive')
+            self.assertTrue((root / '29-10-2026_13-00.cue').is_dir())
+
+    def test_symlink_target_cannot_be_written_or_select_suffix(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
             target = root / 'target'
-            target.touch()
+            target.write_bytes(b'archive')
+            link = root / '29-10-2026_13-00.mp3'
             try:
-                (root / '29-10-2026_13-00_2.mp3').symlink_to(target)
+                link.symlink_to(target)
             except OSError:
                 self.skipTest('symlinks unavailable')
             self.assertEqual(choose_output_pattern(root, '%d-%m-%Y_%H-%M',
                              datetime(2026, 10, 29, 12, 15), 60),
-                             '%d-%m-%Y_%H-%M_3.mp3')
+                             '%d-%m-%Y_%H-%M.mp3')
+            with self.assertRaises(MP3FormatError):
+                MP3AppendFile(link, 48000, 1)
+            self.assertTrue(link.is_symlink())
+            self.assertEqual(target.read_bytes(), b'archive')
 
-    def test_platform_case_rules_are_preserved(self):
+    def test_existing_uppercase_extension_does_not_select_suffix(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
-            (root / '29-10-2026_13-00.MP3').touch()
-            expected = '_2' if os.name == 'nt' else ''
+            existing = root / '29-10-2026_13-00.MP3'
+            existing.write_bytes(b'archive')
             self.assertEqual(choose_output_pattern(root, '%d-%m-%Y_%H-%M',
                              datetime(2026, 10, 29, 12, 15), 60),
-                             '%d-%m-%Y_%H-%M' + expected + '.mp3')
+                             '%d-%m-%Y_%H-%M.mp3')
+            self.assertEqual(existing.read_bytes(), b'archive')
 
 
 class WatchFailureTests(unittest.TestCase):
@@ -56,11 +78,11 @@ class WatchFailureTests(unittest.TestCase):
         recorder.process = process
         with patch.object(recorder, '_start_cleanup_worker'), patch.object(
                 recorder, '_watch_loop', side_effect=OSError('disk failed')), patch.object(
-                recorder, '_discover_segments') as discover, patch.object(
+                recorder, '_sync_output') as sync, patch.object(
                 recorder, '_update_current_cue') as cue:
             recorder._watch()
         process.kill.assert_called_once()
-        discover.assert_called_once()
+        sync.assert_called_once()
         cue.assert_called_once()
         self.assertFalse(recorder.running)
 
@@ -85,7 +107,7 @@ class WatchFailureTests(unittest.TestCase):
         process.poll.return_value = None
         recorder.process = process
         with patch('engine.ensure_disk_space'), patch.object(
-                recorder, '_discover_segments', side_effect=OSError('disk unavailable')):
+                recorder, '_sync_output', side_effect=OSError('disk unavailable')):
             recorder._watch()
         self.assertFalse(recorder.running)
         self.assertTrue(recorder.stop_requested.is_set())

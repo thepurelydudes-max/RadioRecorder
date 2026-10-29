@@ -112,7 +112,7 @@ class MetadataMonitor:
         self.stop_signal = threading.Event()
         self.thread: threading.Thread | None = None
         self.last_title: str | None = None
-        self.seen: set[tuple[str, datetime]] = set()
+        self.seen: set[tuple[str, datetime, str]] = set()
         self._seen_hour: datetime | None = None
         self._guard = threading.RLock()
 
@@ -157,7 +157,9 @@ class MetadataMonitor:
         if hour != self._seen_hour:
             self.seen.clear()
             self._seen_hour = hour
-        key = (event.title, event.at)
+        # A live playback snapshot can seed a resumed CUE even when its
+        # matching history entry predates the new audio capture span.
+        key = (event.title, event.at, event.source)
         if key in self.seen:
             return
         self.seen.add(key)
@@ -169,6 +171,7 @@ class MetadataMonitor:
 
     def _api_loop(self, base: str, password: str, username: str, signal: threading.Event) -> None:
         last_error = ""
+        last_playback_title = None
         while not signal.is_set():
             try:
                 # Authoritative start times cover short jingles that a polling
@@ -183,12 +186,12 @@ class MetadataMonitor:
                           this_hour <= item.at <= now + timedelta(seconds=30)]
                 for item in recent:
                     self._emit(item, signal)
-                if current:
-                    # History usually includes current; add it when it doesn't.
-                    if not any(e.title == current.title and
-                               abs((e.at - current.at).total_seconds()) < 3 for e in recent):
-                        if self.last_title != current.title:
-                            self._emit(current, signal)
+                if current and current.title != last_playback_title:
+                    # Send one current snapshot for each generation/title,
+                    # independently of history. Position jitter on later polls
+                    # must not create additional playback observations.
+                    self._emit(current, signal)
+                    last_playback_title = current.title
                 if last_error:
                     self.on_status("API RadioBOSS восстановлен")
                     last_error = ""
@@ -240,3 +243,4 @@ class MetadataMonitor:
                     self.on_status("Ошибка ICY: " + error)
                     last_error = error
                 signal.wait(5)
+

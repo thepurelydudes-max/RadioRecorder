@@ -86,7 +86,7 @@ class SegmentationTest(unittest.TestCase):
         self.assertEqual(clock_boundary(datetime(2026, 10, 27, 13, 0), 60),
                          datetime(2026, 10, 27, 13, 0))
 
-    def test_build_uses_ffmpeg_clocktime_split(self):
+    def test_build_pipes_independent_frames_for_clocktime_split(self):
         import tempfile
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as folder, patch('engine.ffmpeg_path', return_value='ffmpeg.exe'):
@@ -96,10 +96,12 @@ class SegmentationTest(unittest.TestCase):
                             'bitrate': 128, 'filename_format': '%d-%m-%y_%hh-%mm',
                             'split_enabled': True, 'split_minutes': 60}
             cmd = recorder._build_command()
-            self.assertEqual(cmd[cmd.index('-segment_time') + 1], '3600')
-            self.assertEqual(cmd[cmd.index('-segment_atclocktime') + 1], '1')
-            self.assertEqual(cmd[cmd.index('-strftime') + 1], '1')
-            self.assertIn('%H-%M', cmd[-1])
+            self.assertEqual(cmd[-2:], ['mp3', 'pipe:1'])
+            for option in ('-reservoir', '-write_xing', '-id3v2_version'):
+                self.assertEqual(cmd[cmd.index(option) + 1], '0')
+            self.assertNotIn('-segment_time', cmd)
+            self.assertNotIn('-segment_atclocktime', cmd)
+            self.assertNotIn('-strftime', cmd)
 
 
 class RetentionTest(unittest.TestCase):
@@ -258,3 +260,4 @@ class RetentionTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
