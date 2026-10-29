@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+settings.json
+build/
+dist/
+*.spec
+*.exe
+*.zip
+.idea/
+.vscode/
+*.mp3
+*.cue
+ffmpeg-extract/
+retention_state.json
+retention_state.json.tmp
