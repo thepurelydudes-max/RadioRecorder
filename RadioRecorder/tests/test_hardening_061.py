@@ -173,7 +173,7 @@ class ActiveCueRobustnessTests(unittest.TestCase):
             self.assertEqual(path.stat().st_ino, inode)
             self.assertEqual(path.read_bytes(), old + b'  TRACK 02 AUDIO\r\n')
 
-    def test_interrupted_append_is_repaired_by_next_write(self):
+    def test_interrupted_append_preserves_original_and_refuses_replacement(self):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d)/'active.cue'
             first = 'REM DATE 2026\r\n'
@@ -181,8 +181,11 @@ class ActiveCueRobustnessTests(unittest.TestCase):
             write_active_cue(path, first)
             with path.open('ab') as f:
                 f.write(b'   PARTIAL GARBAGE')
-            write_active_cue(path, second, previous_text=first)
-            self.assertEqual(path.read_bytes(), b'\xef\xbb\xbf'+ second.encode())
+            original = path.read_bytes()
+            # A damaged partial CUE must not be truncated or silently replaced.
+            with self.assertRaises(ValueError):
+                write_active_cue(path, second, previous_text=first)
+            self.assertEqual(path.read_bytes(), original)
 
 
 class DiskHeadroomTests(unittest.TestCase):
