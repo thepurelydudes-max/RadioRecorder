@@ -22,10 +22,38 @@ from cues import TrackEvent, make_cue, write_active_cue, read_existing_cue
 from mp3_resume import FrameStream, AppendingMP3
 from audio_levels import peak_dbfs
 
-# WASAPI / PortAudio suggested input buffering (not the read block duration).
-PORTAUDIO_LATENCY_SECONDS = 0.250
-PORTAUDIO_BLOCK_FRAMES = 512
+# One user-visible buffer setting in audio samples. Windows/PortAudio host
+# latency is a suggested value derived from 24 blocks (roughly 256 ms at the
+# default 512 samples / 48 kHz), not an independently configurable setting.
+PORTAUDIO_BLOCK_FRAMES = 512  # default for existing installations
+AUDIO_BUFFER_CHOICES = (128, 256, 512, 1024, 2048)
+AUDIO_BUFFER_LATENCY_BLOCKS = 24
 PORTAUDIO_PIPE_QUEUE_SECONDS = 2.0  # transient FFmpeg stalls; bounded memory
+
+
+def audio_buffer_samples(config: dict) -> int:
+    """One validated user setting for all audio input paths."""
+    try:
+        value = int(config.get('buffer_samples', PORTAUDIO_BLOCK_FRAMES))
+    except (ValueError, TypeError) as exc:
+        raise ValueError('Буфер аудиозахвата должен быть числом сэмплов') from exc
+    if value not in AUDIO_BUFFER_CHOICES:
+        raise ValueError('Буфер аудиозахвата: выбери 128, 256, 512, 1024 или 2048 сэмплов')
+    return value
+
+
+def audio_buffer_latency_seconds(samples: int, sample_rate: int) -> float:
+    """Suggested host latency, automatically scaled for rate and block size.
+
+    This is a PortAudio request, not a guarantee of the driver's actual latency.
+    """
+    if sample_rate <= 0:
+        raise ValueError('Недопустимая частота дискретизации')
+    return AUDIO_BUFFER_LATENCY_BLOCKS * samples / sample_rate
+
+
+def audio_buffer_latency_ms(samples: int, sample_rate: int) -> int:
+    return max(1, round(1000 * audio_buffer_latency_seconds(samples, sample_rate)))
 from ffmpeg_job import attach_kill_on_exit_job, release_job
 
 APP_DIR = Path(__file__).resolve().parent
@@ -101,7 +129,7 @@ def normalize_retention_days(value) -> int:
 
 DEFAULTS = {
     "source": "", "source_kind": "device", "stream_url": "http://localhost:8000/",
-    "sample_rate": 48000, "bitrate": 128, "channels": 1,
+    "sample_rate": 48000, "bitrate": 128, "channels": 1, "buffer_samples": 512,
     "folder": str(Path.home() / "Music" / "RadioRecorder"),
     "filename_format": "%d-%m-%y_%hh-%mm",
     "split_enabled": True, "split_minutes": 60,
@@ -132,6 +160,11 @@ def load_config() -> dict:
             cfg.update({key: value for key, value in data.items() if key in DEFAULTS})
     except (OSError, ValueError):
         pass
+    # Preserve saved user choice on upgrade; fall back to 512 on bad JSON.
+    try:
+        cfg['buffer_samples'] = audio_buffer_samples(cfg)
+    except (ValueError, TypeError):
+        cfg['buffer_samples'] = PORTAUDIO_BLOCK_FRAMES
     if cfg.get('retention_days', 90) is None:
         cfg['retention_days'] = 90
     try:
@@ -146,6 +179,7 @@ def load_config() -> dict:
 def save_config(config: dict) -> None:
     validated = dict(config)
     validated['retention_days'] = normalize_retention_days(validated.get('retention_days', 90))
+    validated['buffer_samples'] = audio_buffer_samples(validated)
     atomic_json_write(SETTINGS_FILE, validated)
 
 
@@ -321,6 +355,7 @@ class Recorder:
         if not config.get('split_enabled', True) and int(config.get('split_minutes', 60)) != 60:
             self.on_status("Разделение отключено: будет один файл")
         self.cfg = config.copy()
+        self.cfg['buffer_samples'] = audio_buffer_samples(self.cfg)
         self.recording_started = datetime.now()
         self.segment = None
         self.events.clear()
@@ -357,8 +392,13 @@ class Recorder:
             cmd.extend(['-f', 's16le', '-ar', str(c.get('_input_rate', c['sample_rate'])),
                         '-ac', str(c.get('_capture_channels', c['channels'])), '-i', 'pipe:0'])
         else:
+            # DirectShow takes milliseconds; derive them from the same single
+            # samples setting, using configured recording sample rate.
+            requested_ms = audio_buffer_latency_ms(audio_buffer_samples(c),
+                                                    int(c['sample_rate']))
             cmd.extend(['-thread_queue_size', '1024', '-f', 'dshow',
-                        '-audio_buffer_size', '250', '-i', 'audio=' + c['source']])
+                        '-audio_buffer_size', str(requested_ms),
+                        '-i', 'audio=' + c['source']])
         cmd += ['-map', '0:a:0', '-vn',
                 # Output stays fixed even if PortAudio falls back to mono
                 # capture. Changing MP3 channel layouts mid-file is unsafe.
@@ -400,6 +440,7 @@ class Recorder:
             requested = int(self.cfg['channels'])
             rate = int(self.cfg['sample_rate'])
             native = int(round(info['default_samplerate']))
+            samples = audio_buffer_samples(self.cfg)
             if max_channels < 1:
                 raise RuntimeError('У аудиоустройства нет входных каналов')
             rates = list(dict.fromkeys([rate, native, 48000, 44100]))
@@ -410,8 +451,8 @@ class Recorder:
                     try:
                         with sd.RawInputStream(device=device_id, samplerate=input_rate,
                                                channels=channels, dtype='int16',
-                                               blocksize=PORTAUDIO_BLOCK_FRAMES,
-                                               latency=PORTAUDIO_LATENCY_SECONDS):
+                                               blocksize=samples,
+                                               latency=audio_buffer_latency_seconds(samples, input_rate)):
                             pass
                         self.cfg['_capture_channels'] = channels
                         self.cfg['_input_rate'] = input_rate
@@ -607,12 +648,14 @@ class Recorder:
             device_id = resolve_device(choice, 'input', devices, apis)
             channels = int(self.cfg.get('_capture_channels', self.cfg['channels']))
             rate = int(self.cfg.get('_input_rate', self.cfg['sample_rate']))
+            samples = audio_buffer_samples(self.cfg)
+            requested_latency = audio_buffer_latency_seconds(samples, rate)
             if proc.stdin is None:
                 raise RuntimeError('Не открыт канал PCM для FFmpeg')
             # 2 seconds of PCM at most, not a fixed delay. Read remains
             # unblocked while the separate writer waits on a slow FFmpeg.
             capacity = max(16, int(rate * PORTAUDIO_PIPE_QUEUE_SECONDS /
-                                    PORTAUDIO_BLOCK_FRAMES + 0.999))
+                                    samples + 0.999))
             blocks: queue.Queue[bytes] = queue.Queue(maxsize=capacity)
             writer = threading.Thread(target=self._pump_portaudio,
                                       args=(proc, blocks, capture_done),
@@ -620,15 +663,21 @@ class Recorder:
             writer.start()
             with sd.RawInputStream(samplerate=rate, device=device_id,
                                    channels=channels, dtype='int16',
-                                   blocksize=PORTAUDIO_BLOCK_FRAMES,
-                                   latency=PORTAUDIO_LATENCY_SECONDS) as stream:
-                self.on_status('Аудиовход: буфер 250 мс, очередь PCM до 2 сек')
+                                   blocksize=samples,
+                                   latency=requested_latency) as stream:
+                # Actual host latency may differ from the requested value.
+                actual_latency = getattr(stream, 'latency', None)
+                displayed = (f'{1000 * actual_latency:.0f} мс фактически'
+                             if isinstance(actual_latency, (int, float))
+                             else f'{1000 * requested_latency:.0f} мс запрошено')
+                self.on_status(f'Аудиовход: {samples} сэмплов, {displayed}; '
+                               'очередь PCM до 2 сек')
                 last_meter = 0.0
                 last_overflow_notice = 0.0
                 overflow_at: list[float] = []
                 near_full_reported = False
                 while not self.stop_requested.is_set() and proc.poll() is None:
-                    data, overflow = stream.read(PORTAUDIO_BLOCK_FRAMES)
+                    data, overflow = stream.read(samples)
                     now = time.monotonic()
                     if overflow:
                         # Data has ALREADY been lost by the host API. Increasing
