@@ -27,7 +27,8 @@ from autostart import configure_login, normalize_startup_settings
 from single_instance import SingleInstanceGuard, show_existing_window
 from device_names import friendly_device_name, settings_device_choices, selection_label
 
-TITLE = "RadioRecorder (0.6.1)"
+VERSION = "0.6.4"
+TITLE = f"RadioRecorder ({VERSION})"
 
 
 def create_diagnostic_logger() -> logging.Logger:
@@ -665,7 +666,7 @@ class RadioRecorderUI(tk.Tk):
         bar.add_cascade(label='RadioRecorder', menu=prog)
         help_menu = tk.Menu(bar, tearoff=False)
         help_menu.add_command(label='О программе', command=lambda: messagebox.showinfo('RadioRecorder',
-            'RadioRecorder 0.6.1\nЛокальная запись MP3 и раздельные CUE из метаданных RadioBOSS.'))
+            f'RadioRecorder {VERSION}\nЛокальная запись MP3 и раздельные CUE из метаданных RadioBOSS.'))
         bar.add_cascade(label='Справка', menu=help_menu)
         self.config(menu=bar)
         wrap = ttk.Frame(self, padding=8)
