@@ -80,13 +80,13 @@ class InputBufferTests(unittest.TestCase):
         self.assertIsNotNone(stereo_info)
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / 'hour.mp3'
-            path.write_bytes(mono_header + b'\\x00' * (mono_info.length - 4))
+            path.write_bytes(mono_header + bytes([0]) * (mono_info.length - 4))
             before = path.read_bytes()
             writer = AppendingMP3(path)
             try:
                 with self.assertRaisesRegex(ValueError, 'Формат нового MP3'):
                     writer.append(stereo_header +
-                                  b'\\x00' * (stereo_info.length - 4),
+                                  bytes([0]) * (stereo_info.length - 4),
                                   stereo_info.duration)
             finally:
                 writer.close()
