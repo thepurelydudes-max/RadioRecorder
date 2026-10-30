@@ -1,4 +1,4 @@
-# Codex development guide — RadioRecorder Python v0.6.4
+# Codex development guide — RadioRecorder Python v0.6.5
 
 This directory contains the **active Python project**. Ignore the historical v0.5.0 source ZIP at the repository root. The Native C# edition is a separate experiment.
 
