@@ -16,7 +16,8 @@ import traceback
 import logging
 from logging.handlers import RotatingFileHandler
 
-from engine import (APP_DIR, DATA_DIR, DEFAULTS, SETTINGS_FILE, Recorder, ffmpeg_path,
+from engine import (APP_DIR, DATA_DIR, DEFAULTS, SETTINGS_FILE, Recorder,
+                    AUDIO_BUFFER_CHOICES, ffmpeg_path,
                     format_to_strftime, is_schedule_active, auto_should_start,
                     next_clock_hour, list_audio_devices, load_config, preview_name, save_config)
 from metadata import MetadataMonitor
@@ -166,7 +167,8 @@ class SettingsWindow(tk.Toplevel):
                     'metadata_icy_url', 'email_to', 'smtp_server', 'smtp_user', 'smtp_password',
                     'monitor_device', 'monitor_input', 'source_label'):
             self.variables[key] = tk.StringVar(value=str(c.get(key, '')))
-        for key in ('bitrate', 'sample_rate', 'channels', 'split_minutes', 'retention_days',
+        for key in ('bitrate', 'sample_rate', 'channels', 'buffer_samples',
+                    'split_minutes', 'retention_days',
                     'silence_seconds', 'silence_db', 'smtp_port'):
             self.variables[key] = tk.StringVar(value=str(c.get(key, DEFAULTS[key])))
         for key in ('split_enabled', 'retention_enabled', 'start_with_windows', 'minimize_on_start',
@@ -328,6 +330,16 @@ class SettingsWindow(tk.Toplevel):
                          state='readonly', width=w).pack(side='left', padx=3)
             if name == 'bitrate':
                 ttk.Label(row, text='kbps').pack(side='left')
+        # Single setting; latency in milliseconds follows automatically
+        # from sample rate and selected sample buffer.
+        buffer_row = ttk.Frame(group)
+        buffer_row.pack(fill='x', pady=(5, 0))
+        ttk.Label(buffer_row, text='Буфер аудиозахвата:').pack(side='left', padx=(0, 6))
+        ttk.Combobox(buffer_row, textvariable=self.v('buffer_samples'),
+                     values=tuple(str(v) for v in AUDIO_BUFFER_CHOICES),
+                     state='readonly', width=7).pack(side='left')
+        ttk.Label(buffer_row, text='сэмплов (мс рассчитываются автоматически)').pack(
+            side='left', padx=(6, 0))
 
     def _update_filename_preview(self, *_args):
         """Show the resulting MP3 basename while the template is edited."""
@@ -471,12 +483,15 @@ class SettingsWindow(tk.Toplevel):
                 new[key] = var.get()
             # The visible Mono/Stereo labels must never reach the FFmpeg args.
             new['channels'] = label_to_channels(self.channel_label.get())
-            for key in ('bitrate', 'sample_rate', 'channels', 'split_minutes', 'retention_days',
+            for key in ('bitrate', 'sample_rate', 'channels', 'buffer_samples',
+                        'split_minutes', 'retention_days',
                         'silence_seconds', 'silence_db', 'smtp_port'):
                 new[key] = int(new[key])
             new['cue_shift_sec'] = float(new['cue_shift_sec'])
             if new['bitrate'] not in (64, 96, 128, 160, 192, 256, 320):
                 raise ValueError('Неверный битрейт')
+            if new['buffer_samples'] not in AUDIO_BUFFER_CHOICES:
+                raise ValueError('Размер буфера: выбери от 128 до 2048 сэмплов')
             if not 1 <= new['split_minutes'] <= 1440:
                 raise ValueError('Интервал от 1 до 1440 минут')
             if not 90 <= new['retention_days'] <= 3650:
@@ -551,7 +566,7 @@ class SettingsWindow(tk.Toplevel):
                         retention_days=new['retention_days'])
             windows_keep_awake(bool(new.get('keep_awake')))
             self.master_ui._reload_settings()
-            self.master_ui._log('Настройки сохранены. Изменения аудиоформата — со следующего запуска записи.')
+            self.master_ui._log('Настройки сохранены. Изменения аудиоформата и буфера — со следующего запуска записи.')
             self.destroy()
         except (ValueError, OSError, RuntimeError) as exc:
             messagebox.showerror('Ошибка настроек', str(exc), parent=self)
