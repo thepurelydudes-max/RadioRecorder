@@ -587,9 +587,10 @@ class Recorder:
                     self._add_encoded_event(event)
             if self._active_mp3 is not None:
                 self._active_mp3.append(frame, duration)
-                # Buffering stays bounded to FFmpeg's pipe; flush so size
-                # watchdog and archive listing see live recording progress.
-                self._active_mp3.flush()
+                # Periodic/size-triggered output flushing keeps the archive
+                # current without issuing a file flush for every MPEG frame.
+                # The writer always flushes and fsyncs on close/clock rollover.
+                self._active_mp3.flush_if_due()
 
     def _add_encoded_event(self, event: TrackEvent) -> None:
         if not self.segment or event.at < self.segment.started:
