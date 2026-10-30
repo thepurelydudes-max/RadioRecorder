@@ -9,6 +9,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import os
+import time
+
+
+# Small, bounded periodic flushes, as used in buffered streaming I/O.
+# Flush is not fsync: only close() forces an OS disk synchronization.
+MP3_FLUSH_INTERVAL_SECONDS = 0.5
+MP3_FLUSH_THRESHOLD_BYTES = 32 * 1024
 
 
 @dataclass(frozen=True)
@@ -159,6 +166,8 @@ class AppendingMP3:
         self.seconds = existing.seconds
         self.frames = existing.frames
         self.signature = existing.signature
+        self._bytes_since_flush = 0
+        self._last_flush_at = time.monotonic()
         self._file = None
         if path.exists():
             self._file = path.open('r+b')
@@ -195,16 +204,34 @@ class AppendingMP3:
         if self.signature is None:
             self.signature = signature
         self._file.write(frame)
+        self._bytes_since_flush += len(frame)
         self.seconds += duration
         self.frames += 1
+
+    def flush_if_due(self) -> bool:
+        """Flush OS-facing buffered output at most twice/second in steady state.
+
+        Size is a second guardrail for backlogs/high-bitrate recordings. Always
+        flush the first frame of a new file, so the archive is immediately
+        visible, and flush on close/hour transition independently.
+        """
+        if (self._bytes_since_flush > 0 and
+                (self.frames == 1 or
+                 self._bytes_since_flush >= MP3_FLUSH_THRESHOLD_BYTES or
+                 time.monotonic() - self._last_flush_at >= MP3_FLUSH_INTERVAL_SECONDS)):
+            self.flush()
+            return True
+        return False
 
     def flush(self) -> None:
         if self._file:
             self._file.flush()
+            self._bytes_since_flush = 0
+            self._last_flush_at = time.monotonic()
 
     def close(self) -> None:
         if self._file:
-            self._file.flush()
+            self.flush()
             self._refresh_existing_xing()
             os.fsync(self._file.fileno())
             self._file.close()
