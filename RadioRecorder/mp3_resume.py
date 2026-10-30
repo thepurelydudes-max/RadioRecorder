@@ -42,6 +42,18 @@ def frame_info(header: bytes) -> FrameInfo | None:
     return FrameInfo(length, (1152 if mpeg1 else 576) / rate)
 
 
+
+def audio_signature(header: bytes) -> tuple[int, int, int]:
+    """Stable MPEG version, sample-rate index and channel count.
+
+    Bitrate may vary within VBR MP3 and is therefore deliberately excluded.
+    A single MP3 must not silently mix sampling rates or mono/stereo frames.
+    """
+    if frame_info(header) is None:
+        raise ValueError('Неверный заголовок MPEG Layer III')
+    return ((header[1] >> 3) & 3, (header[2] >> 2) & 3,
+            1 if header[3] >> 6 == 3 else 2)
+
 def id3v2_length(prefix: bytes) -> int:
     if len(prefix) < 10 or prefix[:3] != b'ID3':
         return 0
@@ -91,6 +103,7 @@ class ExistingMP3:
     valid_length: int
     total_length: int
     frames: int
+    signature: tuple[int, int, int] | None = None
 
 
 def inspect_existing(path: Path) -> ExistingMP3:
@@ -106,6 +119,7 @@ def inspect_existing(path: Path) -> ExistingMP3:
         if pos > size:
             raise ValueError('Оборванный тег MP3: ' + path.name)
         seconds, count = 0., 0
+        signature = None
         while pos + 4 <= size:
             fh.seek(pos)
             header = fh.read(4)
@@ -114,6 +128,11 @@ def inspect_existing(path: Path) -> ExistingMP3:
                 break
             if pos + info.length > size:
                 break
+            current_signature = audio_signature(header)
+            if signature is None:
+                signature = current_signature
+            elif signature != current_signature:
+                raise ValueError('MP3 содержит разные частоты или моно/стерео: ' + path.name)
             pos += info.length
             seconds += info.duration
             count += 1
@@ -127,7 +146,7 @@ def inspect_existing(path: Path) -> ExistingMP3:
             # a resumed file. Crash-truncated frames are preserved separately.
             if remain > 4096 and not (remain == 128 and tail[:3] == b'TAG'):
                 raise ValueError('В существующем MP3 обнаружены повреждённые данные: ' + path.name)
-        return ExistingMP3(seconds, pos, size, count)
+        return ExistingMP3(seconds, pos, size, count, signature)
 
 
 class AppendingMP3:
@@ -139,6 +158,7 @@ class AppendingMP3:
         self.previous_seconds = existing.seconds
         self.seconds = existing.seconds
         self.frames = existing.frames
+        self.signature = existing.signature
         self._file = None
         if path.exists():
             self._file = path.open('r+b')
@@ -167,6 +187,13 @@ class AppendingMP3:
         info = frame_info(frame[:4])
         if info is None or info.length != len(frame):
             raise ValueError('Попытка записать неполный MP3-кадр')
+        signature = audio_signature(frame[:4])
+        if self.signature is not None and signature != self.signature:
+            raise ValueError('Формат нового MP3 отличается от существующего: '
+                             'частота дискретизации или моно/стерео (' +
+                             self.path.name + '). Старый звук сохранён.')
+        if self.signature is None:
+            self.signature = signature
         self._file.write(frame)
         self.seconds += duration
         self.frames += 1
