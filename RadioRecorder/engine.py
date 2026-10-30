@@ -24,7 +24,7 @@ from audio_levels import peak_dbfs
 
 # WASAPI / PortAudio suggested input buffering (not the read block duration).
 PORTAUDIO_LATENCY_SECONDS = 0.250
-PORTAUDIO_BLOCK_FRAMES = 1024
+PORTAUDIO_BLOCK_FRAMES = 512
 PORTAUDIO_PIPE_QUEUE_SECONDS = 2.0  # transient FFmpeg stalls; bounded memory
 from ffmpeg_job import attach_kill_on_exit_job, release_job
 
