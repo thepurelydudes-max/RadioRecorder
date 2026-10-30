@@ -27,7 +27,7 @@ from autostart import configure_login, normalize_startup_settings
 from single_instance import SingleInstanceGuard, show_existing_window
 from device_names import friendly_device_name, settings_device_choices, selection_label
 
-VERSION = "0.6.4"
+VERSION = "0.6.5"
 TITLE = f"RadioRecorder ({VERSION})"
 
 
