@@ -7,6 +7,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 import json
+import queue
 import tempfile
 import sys
 import os
@@ -20,6 +21,11 @@ from typing import Callable
 from cues import TrackEvent, make_cue, write_active_cue, read_existing_cue
 from mp3_resume import FrameStream, AppendingMP3
 from audio_levels import peak_dbfs
+
+# WASAPI / PortAudio suggested input buffering (not the read block duration).
+PORTAUDIO_LATENCY_SECONDS = 0.250
+PORTAUDIO_BLOCK_FRAMES = 1024
+PORTAUDIO_PIPE_QUEUE_SECONDS = 2.0  # transient FFmpeg stalls; bounded memory
 from ffmpeg_job import attach_kill_on_exit_job, release_job
 
 APP_DIR = Path(__file__).resolve().parent
@@ -353,7 +359,10 @@ class Recorder:
         else:
             cmd.extend(['-thread_queue_size', '1024', '-f', 'dshow',
                         '-audio_buffer_size', '250', '-i', 'audio=' + c['source']])
-        cmd += ['-map', '0:a:0', '-vn', '-ac', str(c.get('_capture_channels', c['channels'])), '-ar', str(c['sample_rate'])]
+        cmd += ['-map', '0:a:0', '-vn',
+                # Output stays fixed even if PortAudio falls back to mono
+                # capture. Changing MP3 channel layouts mid-file is unsafe.
+                '-ac', str(c['channels']), '-ar', str(c['sample_rate'])]
         filters = ['ebur128=peak=true']
         if c.get('silence_enabled'):
             filters.insert(0, 'silencedetect=noise=' + str(int(c['silence_db'])) +
@@ -400,7 +409,9 @@ class Recorder:
                 for input_rate in rates:
                     try:
                         with sd.RawInputStream(device=device_id, samplerate=input_rate,
-                                               channels=channels, dtype='int16', blocksize=1024):
+                                               channels=channels, dtype='int16',
+                                               blocksize=PORTAUDIO_BLOCK_FRAMES,
+                                               latency=PORTAUDIO_LATENCY_SECONDS):
                             pass
                         self.cfg['_capture_channels'] = channels
                         self.cfg['_input_rate'] = input_rate
@@ -552,8 +563,42 @@ class Recorder:
             self.last_title = event.title
             self._update_current_cue()
 
+    def _pump_portaudio(self, proc: subprocess.Popen,
+                        blocks: queue.Queue[bytes],
+                        capture_done: threading.Event) -> None:
+        """Never let a slow FFmpeg stdin stall the time-critical capture loop.
+
+        The queue is deliberately bounded. After a prolonged stall we log an
+        error and restart FFmpeg instead of silently dropping PCM samples.
+        """
+        try:
+            if proc.stdin is None:
+                raise RuntimeError('Нет входного канала FFmpeg')
+            pipe = getattr(proc.stdin, 'buffer', proc.stdin)
+            while (not capture_done.is_set() or not blocks.empty()):
+                if proc.poll() is not None:
+                    return
+                try:
+                    pcm = blocks.get(timeout=0.05)
+                except queue.Empty:
+                    continue
+                pipe.write(pcm)
+                pipe.flush()
+        except (OSError, RuntimeError, ValueError) as exc:
+            if not self.stop_requested.is_set() and proc.poll() is None:
+                self.on_status('Ошибка передачи PCM в FFmpeg: ' + str(exc))
+                proc.terminate()
+        finally:
+            if proc.stdin is not None:
+                try:
+                    proc.stdin.close()
+                except (OSError, ValueError):
+                    pass
+
     def _capture_portaudio(self, proc: subprocess.Popen) -> None:
-        """Push only locally captured PCM to FFmpeg; HTTP remains metadata-only."""
+        """Capture at 250 ms target latency; buffer short FFmpeg stalls safely."""
+        capture_done = threading.Event()
+        writer: threading.Thread | None = None
         try:
             import sounddevice as sd
             from monitor import resolve_device
@@ -564,27 +609,64 @@ class Recorder:
             rate = int(self.cfg.get('_input_rate', self.cfg['sample_rate']))
             if proc.stdin is None:
                 raise RuntimeError('Не открыт канал PCM для FFmpeg')
+            # 2 seconds of PCM at most, not a fixed delay. Read remains
+            # unblocked while the separate writer waits on a slow FFmpeg.
+            capacity = max(16, int(rate * PORTAUDIO_PIPE_QUEUE_SECONDS /
+                                    PORTAUDIO_BLOCK_FRAMES + 0.999))
+            blocks: queue.Queue[bytes] = queue.Queue(maxsize=capacity)
+            writer = threading.Thread(target=self._pump_portaudio,
+                                      args=(proc, blocks, capture_done),
+                                      name='portaudio-ffmpeg-pipe', daemon=True)
+            writer.start()
             with sd.RawInputStream(samplerate=rate, device=device_id,
-                                   channels=channels, dtype='int16', blocksize=1024) as stream:
+                                   channels=channels, dtype='int16',
+                                   blocksize=PORTAUDIO_BLOCK_FRAMES,
+                                   latency=PORTAUDIO_LATENCY_SECONDS) as stream:
+                self.on_status('Аудиовход: буфер 250 мс, очередь PCM до 2 сек')
                 last_meter = 0.0
+                last_overflow_notice = 0.0
+                overflow_at: list[float] = []
+                near_full_reported = False
                 while not self.stop_requested.is_set() and proc.poll() is None:
-                    data, overflow = stream.read(1024)
-                    if time.monotonic() - last_meter >= 0.12:
-                        last_meter = time.monotonic()
+                    data, overflow = stream.read(PORTAUDIO_BLOCK_FRAMES)
+                    now = time.monotonic()
+                    if overflow:
+                        # Data has ALREADY been lost by the host API. Increasing
+                        # the queue cannot restore it, so report each episode.
+                        overflow_at = [t for t in overflow_at if now - t <= 10]
+                        overflow_at.append(now)
+                        if now - last_overflow_notice >= 3:
+                            self.on_status('Переполнение аудиовхода PortAudio: потеряны сэмплы')
+                            last_overflow_notice = now
+                        if len(overflow_at) >= 3:
+                            raise RuntimeError('3 переполнения аудиовхода за 10 секунд; '
+                                               'перезапуск захвата вместо записи треска')
+                    if now - last_meter >= 0.12:
+                        last_meter = now
                         self.on_meter(peak_dbfs(data))
-                    proc.stdin.buffer.write(data)
-                    proc.stdin.buffer.flush()
+                    try:
+                        blocks.put_nowait(bytes(data))
+                    except queue.Full as exc:
+                        raise RuntimeError('FFmpeg не успевает принимать PCM: очередь '
+                                           'заполнена за 2 секунды, нужен перезапуск') from exc
+                    if blocks.qsize() >= max(8, 3 * capacity // 4):
+                        if not near_full_reported:
+                            self.on_status('Предупреждение: очередь PCM заполнена более чем на 75%')
+                            near_full_reported = True
+                    elif blocks.qsize() < capacity // 4:
+                        near_full_reported = False
         except (OSError, RuntimeError, ValueError, ImportError) as exc:
             if not self.stop_requested.is_set():
                 self.on_status('Ошибка захвата Windows/PortAudio: ' + str(exc))
                 if proc.poll() is None:
                     proc.terminate()
         finally:
-            if proc.stdin:
-                try:
-                    proc.stdin.close()
-                except (OSError, ValueError):
-                    pass
+            capture_done.set()
+            if writer and writer is not threading.current_thread():
+                writer.join(timeout=2)
+                if writer.is_alive() and proc.poll() is None:
+                    # A blocked pipe must not hang the recorder on stop.
+                    proc.terminate()
 
     def _read_stderr(self, process: subprocess.Popen) -> None:
         if process.stderr is None:
