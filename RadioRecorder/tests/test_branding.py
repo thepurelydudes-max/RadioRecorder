@@ -8,6 +8,10 @@ import app
 
 
 class IconResourcesTests(unittest.TestCase):
+    def test_displayed_version_is_064(self):
+        self.assertEqual(app.VERSION, '0.6.4')
+        self.assertEqual(app.TITLE, 'RadioRecorder (0.6.4)')
+
     def test_icon_files_are_in_source_tree(self):
         root = Path(app.__file__).resolve().parent / 'assets'
         self.assertTrue((root / 'radiorecorder.ico').is_file())
