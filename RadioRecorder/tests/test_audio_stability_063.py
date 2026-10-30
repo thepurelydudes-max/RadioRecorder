@@ -1,4 +1,4 @@
-"""Regression coverage for reliable PortAudio/WASAPI recording at 512/250 ms."""
+"""Regression coverage for derived PortAudio/WASAPI input buffering."""
 from __future__ import annotations
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -8,21 +8,25 @@ import types
 import unittest
 
 from engine import (
-    Recorder, PORTAUDIO_BLOCK_FRAMES, PORTAUDIO_LATENCY_SECONDS,
-    PORTAUDIO_PIPE_QUEUE_SECONDS,
+    Recorder, PORTAUDIO_BLOCK_FRAMES, AUDIO_BUFFER_CHOICES,
+    PORTAUDIO_PIPE_QUEUE_SECONDS, audio_buffer_samples,
+    audio_buffer_latency_seconds, audio_buffer_latency_ms,
 )
 from mp3_resume import AppendingMP3, frame_info
 
 
 class InputBufferTests(unittest.TestCase):
-    def test_block_size_and_latency_are_separate(self):
+    def test_user_sample_setting_automatically_determines_latency(self):
         self.assertEqual(PORTAUDIO_BLOCK_FRAMES, 512)
-        self.assertEqual(PORTAUDIO_LATENCY_SECONDS, .250)
-        self.assertGreater(PORTAUDIO_LATENCY_SECONDS,
-                           PORTAUDIO_BLOCK_FRAMES / 48000)
+        self.assertEqual(AUDIO_BUFFER_CHOICES, (128, 256, 512, 1024, 2048))
+        self.assertEqual(audio_buffer_samples({}), 512)
+        self.assertAlmostEqual(audio_buffer_latency_seconds(512, 48000), .256)
+        self.assertAlmostEqual(audio_buffer_latency_seconds(512, 44100),
+                               512 * 24 / 44100)
+        self.assertEqual(audio_buffer_latency_ms(2048, 48000), 1024)
         self.assertGreater(PORTAUDIO_PIPE_QUEUE_SECONDS, 1.0)
 
-    def test_portaudio_probe_requests_250ms_not_tiny_latency(self):
+    def test_portaudio_probe_derives_latency_from_selected_samples(self):
         recorder = Recorder(lambda _: None)
         recorder.cfg = {
             'source': 'portaudio:VAC Line 1 — Windows WASAPI (#0)',
@@ -48,7 +52,7 @@ class InputBufferTests(unittest.TestCase):
             recorder._prepare_portaudio()
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]['blocksize'], 512)
-        self.assertEqual(calls[0]['latency'], .250)
+        self.assertAlmostEqual(calls[0]['latency'], .256)
         self.assertEqual(recorder.cfg['_capture_channels'], 2)
 
     def test_stereo_mp3_remains_stereo_after_mono_input_fallback(self):
