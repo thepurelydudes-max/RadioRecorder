@@ -114,6 +114,9 @@ class HourlyResumeTests(unittest.TestCase):
                 recovered._append_encoded_frame(FRAME, INFO.duration)
             recovered.add_event(TrackEvent(start + timedelta(minutes=2, seconds=2),
                                            'После восстановления'))
+            # A buffered writer may still hold its last few complete frames;
+            # explicitly flush before inspecting a live file in this test.
+            recovered._active_mp3.flush()
             self.assertTrue(saved.read_bytes().startswith(original))
             self.assertEqual(len(saved.read_bytes()), 420 * len(FRAME))
             restored = read_existing_cue(saved.with_suffix('.cue'))
